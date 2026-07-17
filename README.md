@@ -123,7 +123,9 @@ With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `hedge_requests_total` | counter | Chat-completion requests handled. |
+| `hedge_requests_failed_total` | counter | Requests that produced no winner (every backend failed → the client got a 502). |
 | `hedge_backend_wins_total{backend}` | counter | Requests won, per backend. |
+| `hedge_backend_losses_total{backend,reason}` | counter | Requests lost, per backend, by `reason` (`error`, `no_usable_token`, `canceled`) — so per-backend loss/error rate is computable. Cardinality is bounded to backends × 3. |
 | `hedge_redundant_requests_total` | counter | Speculative backups started beyond the primary. |
 | `hedge_first_token_latency_seconds` | histogram | First-token latency distribution. |
 | `hedge_latency_saved_seconds_total` | counter | Estimated cumulative first-token latency saved by hedging. |

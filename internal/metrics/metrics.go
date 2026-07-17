@@ -85,9 +85,17 @@ func (h *histogram) snapshot() histSnapshot {
 	}
 }
 
+// lossKey identifies one per-backend loss counter series. The reason is bounded
+// to the fixed hedge.LossReason* set, so cardinality stays backends × reasons.
+type lossKey struct {
+	backend string
+	reason  string
+}
+
 // Registry holds all hedge-llm metrics and renders the Prometheus exposition.
 type Registry struct {
 	requestsTotal          atomic.Uint64
+	requestsFailedTotal    atomic.Uint64
 	redundantRequestsTotal atomic.Uint64
 	latencySavedSeconds    atomic.Uint64 // float64 bits via math.Float64bits
 
@@ -95,6 +103,9 @@ type Registry struct {
 
 	winsMu sync.Mutex
 	wins   map[string]*atomic.Uint64
+
+	lossesMu sync.Mutex
+	losses   map[lossKey]*atomic.Uint64
 
 	inFlightFn func() int
 }
@@ -108,6 +119,7 @@ func NewRegistry(buckets []float64) *Registry {
 	return &Registry{
 		firstTokenLatency: newHistogram(buckets),
 		wins:              make(map[string]*atomic.Uint64),
+		losses:            make(map[lossKey]*atomic.Uint64),
 		inFlightFn:        func() int { return 0 },
 	}
 }
@@ -123,6 +135,10 @@ func (r *Registry) SetInFlightFunc(fn func() int) {
 
 // IncRequests increments hedge_requests_total.
 func (r *Registry) IncRequests() { r.requestsTotal.Add(1) }
+
+// IncFailedRequests increments hedge_requests_failed_total (requests that
+// produced no winner — every backend failed, so the client got an error).
+func (r *Registry) IncFailedRequests() { r.requestsFailedTotal.Add(1) }
 
 // AddRedundantRequests adds n to hedge_redundant_requests_total (the number of
 // speculative backups started beyond the primary).
@@ -148,6 +164,23 @@ func (r *Registry) ObserveWin(backend string) {
 		r.wins[backend] = c
 	}
 	r.winsMu.Unlock()
+	c.Add(1)
+}
+
+// ObserveLoss records that the named backend lost a request for the given
+// reason (one of the hedge.LossReason* values). It mirrors ObserveWin's
+// locking: the lock guards only the map (locate-or-insert the per-series
+// counter), and the *atomic.Uint64 is incremented after the unlock. Reasons are
+// bounded to a fixed set, so the map stays at backends × reasons entries.
+func (r *Registry) ObserveLoss(backend, reason string) {
+	k := lossKey{backend: backend, reason: reason}
+	r.lossesMu.Lock()
+	c := r.losses[k]
+	if c == nil {
+		c = new(atomic.Uint64)
+		r.losses[k] = c
+	}
+	r.lossesMu.Unlock()
 	c.Add(1)
 }
 
@@ -197,12 +230,41 @@ func (r *Registry) winsSnapshot() []struct {
 	return out
 }
 
+// lossSample is one rendered per-backend loss series.
+type lossSample struct {
+	backend string
+	reason  string
+	value   uint64
+}
+
+// lossesSnapshot returns a stable view of per-backend loss counts, sorted by
+// (backend, reason) so the exposition is deterministic.
+func (r *Registry) lossesSnapshot() []lossSample {
+	r.lossesMu.Lock()
+	out := make([]lossSample, 0, len(r.losses))
+	for k, c := range r.losses {
+		out = append(out, lossSample{backend: k.backend, reason: k.reason, value: c.Load()})
+	}
+	r.lossesMu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].backend != out[j].backend {
+			return out[i].backend < out[j].backend
+		}
+		return out[i].reason < out[j].reason
+	})
+	return out
+}
+
 // WriteTo renders the full Prometheus text exposition to w.
 func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	var b strings.Builder
 
 	writeCounter(&b, "hedge_requests_total",
 		"Total chat-completion requests handled.", r.requestsTotal.Load())
+
+	writeCounter(&b, "hedge_requests_failed_total",
+		"Requests that produced no winner (every backend failed).",
+		r.requestsFailedTotal.Load())
 
 	// Per-backend win counter (a single HELP/TYPE header, one line per label).
 	b.WriteString("# HELP hedge_backend_wins_total Requests won by each backend.\n")
@@ -212,6 +274,20 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 		b.WriteString(quoteLabelValue(w.backend))
 		b.WriteString("} ")
 		b.WriteString(strconv.FormatUint(w.value, 10))
+		b.WriteByte('\n')
+	}
+
+	// Per-backend loss counter, labelled by backend AND reason. Label keys are
+	// emitted in sorted order (backend, then reason) and values are quoted.
+	b.WriteString("# HELP hedge_backend_losses_total Requests lost by each backend, by reason.\n")
+	b.WriteString("# TYPE hedge_backend_losses_total counter\n")
+	for _, l := range r.lossesSnapshot() {
+		b.WriteString("hedge_backend_losses_total{backend=")
+		b.WriteString(quoteLabelValue(l.backend))
+		b.WriteString(",reason=")
+		b.WriteString(quoteLabelValue(l.reason))
+		b.WriteString("} ")
+		b.WriteString(strconv.FormatUint(l.value, 10))
 		b.WriteByte('\n')
 	}
 

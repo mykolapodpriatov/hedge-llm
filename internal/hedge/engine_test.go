@@ -1064,6 +1064,81 @@ func TestFireAfterFuncDrivesBackupStart(t *testing.T) {
 	})
 }
 
+// Issue #3: every started, non-winning backend is recorded in Outcome.Losses
+// with the right {backend, reason}. A backend that errors on Stream records
+// "error"; one that closes with no usable token records "no_usable_token"; the
+// winner never appears. The pairs flow to the metrics exposition unchanged.
+func TestPerBackendLossReasonsRecorded(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	errBE := &backend.FakeBackend{
+		BackendName: "erroring", Clock: clk,
+		StartErr: errors.New("connect failed"),
+	}
+	notok := &backend.FakeBackend{
+		BackendName: "no-token", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          nil, EmitFinish: true, // closes with no usable token
+	}
+	win := &backend.FakeBackend{
+		BackendName: "winner", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          []string{"W"}, EmitFinish: true,
+	}
+	// fire_after huge → loss-driven progression: each loss starts the next
+	// backend, so all three states are exercised in order.
+	pol := policy.HedgePolicy{FireAfter: time.Hour, MaxInFlight: 3}
+	e := NewEngine([]backend.Backend{errBE, notok, win}, pol, clk)
+
+	d := startDriver(clk, time.Millisecond)
+	defer d.Stop()
+
+	o, err := runEngine(t, e, context.Background(), &captureSink{})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if o.Winner != "winner" {
+		t.Fatalf("winner=%q want winner", o.Winner)
+	}
+
+	got := map[string]string{}
+	for _, l := range o.Losses {
+		if prev, dup := got[l.Backend]; dup {
+			t.Errorf("duplicate loss for %q (had %q, now %q)", l.Backend, prev, l.Reason)
+		}
+		got[l.Backend] = l.Reason
+	}
+	if got["erroring"] != LossReasonError {
+		t.Errorf("erroring reason=%q want %q", got["erroring"], LossReasonError)
+	}
+	if got["no-token"] != LossReasonNoUsableToken {
+		t.Errorf("no-token reason=%q want %q", got["no-token"], LossReasonNoUsableToken)
+	}
+	if _, ok := got["winner"]; ok {
+		t.Errorf("winner must not appear in losses: %+v", o.Losses)
+	}
+	if len(o.Losses) != 2 {
+		t.Errorf("losses=%d want 2 (the two non-winning backends)", len(o.Losses))
+	}
+
+	// The {backend,reason} pairs flow to the metrics exposition exactly as the
+	// proxy feeds them.
+	reg := metrics.NewRegistry(nil)
+	for _, l := range o.Losses {
+		reg.ObserveLoss(l.Backend, l.Reason)
+	}
+	var sb strings.Builder
+	if _, err := reg.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	text := sb.String()
+	if !strings.Contains(text, `hedge_backend_losses_total{backend="erroring",reason="error"} 1`) {
+		t.Errorf("missing erroring loss series:\n%s", text)
+	}
+	if !strings.Contains(text, `hedge_backend_losses_total{backend="no-token",reason="no_usable_token"} 1`) {
+		t.Errorf("missing no-token loss series:\n%s", text)
+	}
+}
+
 func TestOutcomeHelpers(t *testing.T) {
 	o := Outcome{Started: 3, FirstTokenLatency: 10 * time.Millisecond, PrimaryFirstToken: 25 * time.Millisecond}
 	if o.RedundantStarts() != 2 {

@@ -78,6 +78,31 @@ type Sink interface {
 	Chunk(c oapi.Chunk) error
 }
 
+// Loss reasons recorded on Loss.Reason. They are bounded to this small fixed
+// set so the hedge_backend_losses_total metric's cardinality is backends × 3.
+const (
+	// LossReasonError means the backend's Stream() failed synchronously, so it
+	// never issued an upstream request.
+	LossReasonError = "error"
+	// LossReasonNoUsableToken means the backend's stream closed on its own
+	// without ever producing a usable token.
+	LossReasonNoUsableToken = "no_usable_token"
+	// LossReasonCanceled means the backend was context-cancelled before it could
+	// win — a loser torn down the instant a winner committed, or a backend torn
+	// down on client disconnect / run teardown before producing a usable token.
+	LossReasonCanceled = "canceled"
+)
+
+// Loss records that one started backend did not win a run, and why. Winners are
+// never included. The set of reasons is fixed (see the LossReason* constants).
+type Loss struct {
+	// Backend is the losing backend's name.
+	Backend string
+	// Reason is one of LossReasonError, LossReasonNoUsableToken, or
+	// LossReasonCanceled.
+	Reason string
+}
+
 // Outcome summarises a completed hedge run for metrics/inspection.
 type Outcome struct {
 	// Winner is the name of the backend that won, or "" if none did.
@@ -93,6 +118,10 @@ type Outcome struct {
 	// PrimaryFirstToken, when non-zero, is the primary's own first-usable-token
 	// latency (used to estimate latency saved when a backup won).
 	PrimaryFirstToken time.Duration
+	// Losses lists every started backend that did NOT win, each tagged with the
+	// reason it lost. The winner (if any) is never included. Backends that were
+	// never started (e.g. gated out by the policy) do not appear.
+	Losses []Loss
 }
 
 // RedundantStarts is the number of speculative backups started beyond the
@@ -192,12 +221,13 @@ type event struct {
 
 // backendState tracks one started backend during a run.
 type backendState struct {
-	be      backend.Backend
-	cancel  context.CancelFunc // cancels ONLY this backend's context
-	firstAt time.Duration      // first-usable-token latency, 0 until/unless seen
-	lost    bool               // channel closed with no usable token
-	closed  bool               // channel fully closed
-	failed  bool               // Stream() returned an error synchronously (reservation rolled back)
+	be         backend.Backend
+	cancel     context.CancelFunc // cancels ONLY this backend's context
+	firstAt    time.Duration      // first-usable-token latency, 0 until/unless seen
+	lost       bool               // channel closed with no usable token
+	closed     bool               // channel fully closed
+	failed     bool               // Stream() returned an error synchronously (reservation rolled back)
+	lossReason string             // why this backend lost; "" until determined (defaults to canceled)
 }
 
 // run holds the mutable state of a single Run invocation.
@@ -212,6 +242,7 @@ type run struct {
 	states    []*backendState
 	nextIdx   int
 	reserved  int // backends this run reserved against the engine's inFlight
+	winnerIdx int // index of the winning state, -1 until/unless a winner is chosen
 }
 
 // Run executes one hedged request. It blocks until a winner has been fully
@@ -236,6 +267,7 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		req:       req,
 		start:     e.clk.Now(),
 		fireAfter: e.resolveFireAfter(),
+		winnerIdx: -1,
 		wg:        &wg,
 		// Buffer sized len(backends)*2 so each backend can have BOTH an in-flight
 		// chunk event and its final close event queued without a forwarder ever
@@ -264,6 +296,7 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		Started:           r.started(),
 		FirstTokenLatency: firstTok,
 		PrimaryFirstToken: primaryFirst,
+		Losses:            r.losses(),
 	}
 	if winner == "" && relayErr == nil {
 		relayErr = ErrAllBackendsFailed
@@ -286,6 +319,30 @@ func (r *run) started() int {
 		n++
 	}
 	return n
+}
+
+// losses builds the per-backend loss list for the completed run: every started
+// backend except the winner, tagged with the reason recorded on its state. A
+// started backend that has no explicit reason (it was a loser cancelled the
+// instant a winner committed, or torn down on client disconnect, before it
+// closed on its own) defaults to LossReasonCanceled. Backends that were never
+// started (gated out by the policy) have no state and never appear.
+func (r *run) losses() []Loss {
+	if len(r.states) == 0 {
+		return nil
+	}
+	out := make([]Loss, 0, len(r.states))
+	for i, st := range r.states {
+		if i == r.winnerIdx {
+			continue // the winner is not a loss
+		}
+		reason := st.lossReason
+		if reason == "" {
+			reason = LossReasonCanceled
+		}
+		out = append(out, Loss{Backend: st.be.Name(), Reason: reason})
+	}
+	return out
 }
 
 // committedCostDelta returns the total speculative cost this run STILL holds
@@ -350,6 +407,7 @@ func (r *run) startNext() bool {
 		st.failed = true
 		st.lost = true
 		st.closed = true
+		st.lossReason = LossReasonError
 		r.reserved--
 		e.releaseN(1, be.CostPerRequest())
 		// Emit a synthetic close event so the race loop processes the loss
@@ -447,7 +505,6 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	armFire()
 
 	var winnerOnce sync.Once
-	winnerIdx := -1
 	var winnerFirst oapi.Chunk
 
 	for {
@@ -477,6 +534,13 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 				st.closed = true
 				if st.firstAt == 0 {
 					st.lost = true
+					// A close with no usable token is a genuine no-usable-token
+					// loss. Guard against overwriting an already-recorded reason:
+					// a synchronously-failed start (LossReasonError) also emits a
+					// synthetic close event that lands here.
+					if st.lossReason == "" {
+						st.lossReason = LossReasonNoUsableToken
+					}
 					if r.shouldStartAfterLoss() {
 						r.startNext()
 						armFire()
@@ -502,7 +566,7 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 			won := false
 			winnerOnce.Do(func() {
 				won = true
-				winnerIdx = ev.idx
+				r.winnerIdx = ev.idx
 				winnerFirst = ev.chunk
 				winnerName = st.be.Name()
 				firstTok = e.clk.Now().Sub(r.start)
@@ -514,11 +578,11 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 				// content is never forwarded (relay discards non-winner events).
 				fireTimer.Stop()
 				armed = false
-				r.cancelLosers(winnerIdx)
+				r.cancelLosers(r.winnerIdx)
 				if err := sink.Commit(winnerName, winnerFirst); err != nil {
 					return winnerName, firstTok, primaryFirst, err
 				}
-				relayErr = r.relay(sink, winnerIdx)
+				relayErr = r.relay(sink, r.winnerIdx)
 				return winnerName, firstTok, primaryFirst, relayErr
 			}
 		}
