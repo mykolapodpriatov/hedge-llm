@@ -114,7 +114,7 @@ Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDG
 
 ### Adaptive timing
 
-With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer of each backend's recent first-token latencies and can suggest a `fire_after` from the primary's recent p50 — waiting roughly as long as the primary usually takes before hedging. Statistics are in-memory only (no persistence) and bounded to `window` samples per backend. Off by default (static `fire_after`).
+With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer of each backend's recent first-token latencies and derives **each request's** `fire_after` from the primary's recent p50 — waiting roughly as long as the primary usually takes before hedging. Until the primary has collected `min_samples` samples the static `fire_after` is used; once enough samples exist, its p50 governs when the first backup fires. Statistics are in-memory only (no persistence) and bounded to `window` samples per backend. Off by default (static `fire_after`).
 
 ## Metrics
 

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"hedge-llm/internal/adaptive"
 	"hedge-llm/internal/backend"
 	"hedge-llm/internal/clock"
 	"hedge-llm/internal/metrics"
@@ -950,6 +951,117 @@ func TestSingleBackendStartErrorReturnsPromptly(t *testing.T) {
 	if got := e.InFlight(); got != 0 {
 		t.Errorf("inFlight=%d after run, want 0", got)
 	}
+}
+
+// Issue #2: the engine consults a WithFireAfterFunc option once per Run to
+// derive the fire-after delay, so a seeded adaptive estimator's p50 — not the
+// static policy.FireAfter — times the backup start. Below the estimator's
+// min_samples the suggestion falls back to the static value, and with no
+// function installed adaptive timing is off entirely.
+//
+// The scenario is chosen so the fire-after delay alone decides the winner: the
+// primary is slow (200ms first token) while a backup that starts EARLY (at the
+// 20ms p50) produces at 30ms and wins, but a backup gated on the huge static
+// delay never starts and the slow primary wins.
+func TestFireAfterFuncDrivesBackupStart(t *testing.T) {
+	const (
+		staticFireAfter = time.Hour // static value → backup would never fire in test time
+		p50             = 20 * time.Millisecond
+		minSamples      = 5
+	)
+	newBackends := func(clk *clock.FakeClock) []backend.Backend {
+		primary := &backend.FakeBackend{
+			BackendName: "primary", Clock: clk,
+			FirstTokenDelay: 200 * time.Millisecond,
+			Tokens:          []string{"P"}, EmitFinish: true,
+		}
+		backup := &backend.FakeBackend{
+			BackendName: "backup", Clock: clk,
+			FirstTokenDelay: 10 * time.Millisecond,
+			Tokens:          []string{"B"}, EmitFinish: true,
+		}
+		return []backend.Backend{primary, backup}
+	}
+	// A seeded estimator whose primary p50 is exactly p50 (constant samples).
+	seededEstimator := func(samples int) *adaptive.Estimator {
+		est := adaptive.NewEstimator(64)
+		for i := 0; i < samples; i++ {
+			est.Observe("primary", p50)
+		}
+		return est
+	}
+	// The static policy fire-after is huge, so ANY early backup start must come
+	// from the adaptive suggestion, not the policy.
+	pol := policy.HedgePolicy{FireAfter: staticFireAfter, MaxInFlight: 2}
+	// Mirror exactly how cmd/hedge-llm wires the estimator into the engine.
+	fireAfterFunc := func(est *adaptive.Estimator) func(string) time.Duration {
+		return func(primary string) time.Duration {
+			return est.SuggestFireAfter(primary, staticFireAfter, minSamples)
+		}
+	}
+
+	t.Run("p50 times the backup start at/above min_samples", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		est := seededEstimator(minSamples + 1) // enough samples → suggestion is the p50
+		e := NewEngine(newBackends(clk), pol, clk, WithFireAfterFunc(fireAfterFunc(est)))
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		// The backup fired at the p50 (20ms) and produced (30ms) before the
+		// primary's 200ms first token → backup wins and TWO backends started.
+		if o.Winner != "backup" {
+			t.Errorf("winner=%q want backup (backup must fire at the adaptive p50, not the static value)", o.Winner)
+		}
+		if o.Started != 2 {
+			t.Errorf("started=%d want 2 (adaptive fire-after started the backup)", o.Started)
+		}
+	})
+
+	t.Run("below min_samples falls back to the static fire_after", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		est := seededEstimator(minSamples - 3) // too few samples → suggestion is the static value
+		e := NewEngine(newBackends(clk), pol, clk, WithFireAfterFunc(fireAfterFunc(est)))
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		// With the static (huge) fire-after the backup never starts; the primary's
+		// 200ms token wins and only ONE backend started.
+		if o.Winner != "primary" {
+			t.Errorf("winner=%q want primary (below min_samples must use the static fire_after)", o.Winner)
+		}
+		if o.Started != 1 {
+			t.Errorf("started=%d want 1 (static fire_after must not start the backup)", o.Started)
+		}
+	})
+
+	t.Run("adaptive off by default (no fire-after func)", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		// A fully-seeded estimator exists but is NOT wired into the engine, so its
+		// p50 must be ignored and the static fire_after governs.
+		_ = seededEstimator(minSamples + 1)
+		e := NewEngine(newBackends(clk), pol, clk) // no WithFireAfterFunc
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if o.Winner != "primary" || o.Started != 1 {
+			t.Errorf("winner=%q started=%d want primary/1 (adaptive must be off by default)", o.Winner, o.Started)
+		}
+	})
 }
 
 func TestOutcomeHelpers(t *testing.T) {

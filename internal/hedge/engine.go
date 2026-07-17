@@ -121,6 +121,12 @@ type Engine struct {
 	pol      policy.HedgePolicy
 	clk      clock.Clock
 
+	// fireAfterFn, when non-nil, is consulted ONCE per Run to derive that run's
+	// fire-after delay from the primary backend's name (e.g. the adaptive
+	// estimator's SuggestFireAfter). It falls back to the static
+	// policy.FireAfter when nil or when it returns a non-positive duration.
+	fireAfterFn func(primary string) time.Duration
+
 	// mu guards inFlight + committedCost. The start decision is a
 	// check-and-increment under this single lock so two goroutines can never
 	// both observe headroom and both start (no TOCTOU on the bounds).
@@ -129,12 +135,43 @@ type Engine struct {
 	committedCost float64
 }
 
+// Option configures an Engine at construction.
+type Option func(*Engine)
+
+// WithFireAfterFunc installs a function consulted ONCE per Run to derive that
+// run's fire-after delay from the primary backend's name. This is how adaptive
+// timing is wired in: pass adaptive.Estimator.SuggestFireAfter (bound to the
+// configured default delay and min-samples). When no function is installed, or
+// it returns a non-positive duration, the engine uses the static
+// policy.FireAfter — so adaptive timing is off by default.
+func WithFireAfterFunc(fn func(primary string) time.Duration) Option {
+	return func(e *Engine) { e.fireAfterFn = fn }
+}
+
 // NewEngine constructs an Engine. clk defaults to clock.RealClock if nil.
-func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clock) *Engine {
+func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clock, opts ...Option) *Engine {
 	if clk == nil {
 		clk = clock.RealClock{}
 	}
-	return &Engine{backends: backends, pol: pol, clk: clk}
+	e := &Engine{backends: backends, pol: pol, clk: clk}
+	for _, o := range opts {
+		o(e)
+	}
+	return e
+}
+
+// resolveFireAfter consults the optional per-run fire-after function once,
+// falling back to the static policy FireAfter when no function is installed or
+// it returns a non-positive duration. The primary is backends[0]; callers must
+// only invoke this when at least one backend exists.
+func (e *Engine) resolveFireAfter() time.Duration {
+	if e.fireAfterFn == nil {
+		return e.pol.FireAfter
+	}
+	if d := e.fireAfterFn(e.backends[0].Name()); d > 0 {
+		return d
+	}
+	return e.pol.FireAfter
 }
 
 // InFlight returns the current number of in-flight backends across the engine,
@@ -165,15 +202,16 @@ type backendState struct {
 
 // run holds the mutable state of a single Run invocation.
 type run struct {
-	e        *Engine
-	runCtx   context.Context
-	req      *oapi.Request
-	start    time.Time
-	wg       *sync.WaitGroup
-	events   chan event
-	states   []*backendState
-	nextIdx  int
-	reserved int // backends this run reserved against the engine's inFlight
+	e         *Engine
+	runCtx    context.Context
+	req       *oapi.Request
+	start     time.Time
+	fireAfter time.Duration // this run's resolved fire-after delay (adaptive or static)
+	wg        *sync.WaitGroup
+	events    chan event
+	states    []*backendState
+	nextIdx   int
+	reserved  int // backends this run reserved against the engine's inFlight
 }
 
 // Run executes one hedged request. It blocks until a winner has been fully
@@ -193,11 +231,12 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 	runCtx, cancelAll := context.WithCancel(clientCtx)
 	var wg sync.WaitGroup
 	r := &run{
-		e:      e,
-		runCtx: runCtx,
-		req:    req,
-		start:  e.clk.Now(),
-		wg:     &wg,
+		e:         e,
+		runCtx:    runCtx,
+		req:       req,
+		start:     e.clk.Now(),
+		fireAfter: e.resolveFireAfter(),
+		wg:        &wg,
 		// Buffer sized len(backends)*2 so each backend can have BOTH an in-flight
 		// chunk event and its final close event queued without a forwarder ever
 		// blocking on a full channel — a margin that keeps a benign future change
@@ -386,7 +425,7 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// ONE re-armable fire-after timer reused for the whole race (NOT a fresh
 	// timer per re-arm, which would leak abandoned *time.Timers). It starts
 	// stopped/disarmed; armFire Resets it, and it is Stopped when the race ends.
-	fireTimer := e.clk.NewTimer(e.pol.FireAfter)
+	fireTimer := e.clk.NewTimer(r.fireAfter)
 	fireTimer.Stop()
 	defer fireTimer.Stop()
 	armed := false
@@ -398,7 +437,7 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// harmless extra timer fire that startNext then declines.
 	armFire := func() {
 		if e.pol.HasHeadroom(e.InFlight()) && r.hasMore() {
-			fireTimer.Reset(e.pol.FireAfter)
+			fireTimer.Reset(r.fireAfter)
 			armed = true
 		} else {
 			fireTimer.Stop()
