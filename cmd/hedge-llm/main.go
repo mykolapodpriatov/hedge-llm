@@ -13,12 +13,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -30,19 +34,49 @@ import (
 	"hedge-llm/internal/proxy"
 )
 
+// version is the build version, overridable at link time with
+// -ldflags "-X main.version=<v>". It is reported by -version and exported on
+// /metrics as the hedge_build_info gauge.
+var version = "dev"
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
 		log.Fatalf("hedge-llm: %v", err)
 	}
 }
 
-func run() error {
-	configPath := flag.String("config", "", "path to JSON config file (HEDGE_LLM_* env vars override scalars)")
-	flag.Parse()
+// run parses args against a local flag set and either services an
+// informational flag (-version / -print-config, writing to out and returning)
+// or starts the daemon. Threading args and out through the signature (instead of
+// the global flag set and os.Stdout) is what makes run testable.
+func run(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("hedge-llm", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to JSON config file (HEDGE_LLM_* env vars override scalars)")
+	showVersion := fs.Bool("version", false, "print the build version and exit")
+	printConfig := fs.Bool("print-config", false, "print the effective validated config as JSON and exit")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+
+	if *showVersion {
+		_, _ = fmt.Fprintln(out, version)
+		return nil
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+
+	// API keys live only in the environment (never in the config), so emitting
+	// the effective merged/validated config as JSON is safe.
+	if *printConfig {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		return enc.Encode(cfg)
 	}
 
 	// One shared HTTP client (no overall timeout — streaming responses are
@@ -59,6 +93,7 @@ func run() error {
 	backends := cfg.BuildBackends(httpClient)
 
 	reg := metrics.NewRegistry(nil)
+	reg.SetBuildInfo(version, runtime.Version())
 
 	// Adaptive timing (opt-in): a single estimator both records per-backend
 	// first-token latencies (via the proxy's LatencyObserver) and supplies the

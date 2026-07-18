@@ -107,6 +107,9 @@ type Registry struct {
 	lossesMu sync.Mutex
 	losses   map[lossKey]*atomic.Uint64
 
+	buildInfoMu sync.Mutex
+	buildInfo   map[string]string // labels for hedge_build_info, nil until set
+
 	inFlightFn func() int
 }
 
@@ -131,6 +134,19 @@ func (r *Registry) SetInFlightFunc(fn func() int) {
 	if fn != nil {
 		r.inFlightFn = fn
 	}
+}
+
+// SetBuildInfo records the labels for the hedge_build_info gauge, a constant
+// "1" series identifying the running build (e.g. version="v1.2.3",
+// go_version="go1.26.4"). The line is rendered on /metrics only after this is
+// called; labels are emitted in sorted, quoted form.
+func (r *Registry) SetBuildInfo(version, goVersion string) {
+	r.buildInfoMu.Lock()
+	r.buildInfo = map[string]string{
+		"version":    version,
+		"go_version": goVersion,
+	}
+	r.buildInfoMu.Unlock()
 }
 
 // IncRequests increments hedge_requests_total.
@@ -259,6 +275,8 @@ func (r *Registry) lossesSnapshot() []lossSample {
 func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	var b strings.Builder
 
+	r.writeBuildInfo(&b)
+
 	writeCounter(&b, "hedge_requests_total",
 		"Total chat-completion requests handled.", r.requestsTotal.Load())
 
@@ -322,6 +340,45 @@ func (r *Registry) writeHistogram(b *strings.Builder, name, help string) {
 	fmt.Fprintf(b, "%s_bucket{le=\"+Inf\"} %d\n", name, snap.count)
 	fmt.Fprintf(b, "%s_sum %s\n", name, formatFloat(snap.sum))
 	fmt.Fprintf(b, "%s_count %d\n", name, snap.count)
+}
+
+// writeBuildInfo renders the hedge_build_info gauge if build labels have been
+// set. It emits nothing when SetBuildInfo has not been called.
+func (r *Registry) writeBuildInfo(b *strings.Builder) {
+	r.buildInfoMu.Lock()
+	labels := r.buildInfo
+	r.buildInfoMu.Unlock()
+	if len(labels) == 0 {
+		return
+	}
+	b.WriteString("# HELP hedge_build_info Build metadata for the running binary (constant 1).\n")
+	b.WriteString("# TYPE hedge_build_info gauge\n")
+	b.WriteString("hedge_build_info")
+	writeLabels(b, labels)
+	b.WriteString(" 1\n")
+}
+
+// writeLabels renders a label set in sorted key order with quoted values, e.g.
+// {go_version="go1.26.4",version="dev"}. An empty set renders nothing.
+func writeLabels(b *strings.Builder, labels map[string]string) {
+	if len(labels) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(quoteLabelValue(labels[k]))
+	}
+	b.WriteByte('}')
 }
 
 func writeCounter(b *strings.Builder, name, help string, v uint64) {

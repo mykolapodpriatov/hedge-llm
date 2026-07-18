@@ -339,6 +339,37 @@ func TestLatencySavedFloatCounter(t *testing.T) {
 	}
 }
 
+func TestBuildInfoGauge(t *testing.T) {
+	r := NewRegistry(nil)
+	r.SetBuildInfo("v1.2.3", "go1.26.4")
+
+	text := render(t, r)
+	p := parseExposition(t, text)
+
+	if p.typ["hedge_build_info"] != "gauge" {
+		t.Errorf("build_info type=%q want gauge", p.typ["hedge_build_info"])
+	}
+	if _, ok := p.help["hedge_build_info"]; !ok {
+		t.Error("missing HELP for hedge_build_info")
+	}
+	if got := sampleValue(p, "hedge_build_info", map[string]string{
+		"version": "v1.2.3", "go_version": "go1.26.4",
+	}); got != "1" {
+		t.Errorf("build_info value=%q want 1", got)
+	}
+	// Labels must be rendered sorted (go_version before version) and quoted.
+	if !strings.Contains(text, `hedge_build_info{go_version="go1.26.4",version="v1.2.3"} 1`) {
+		t.Errorf("build_info line not rendered with sorted, quoted labels:\n%s", text)
+	}
+}
+
+func TestBuildInfoAbsentUntilSet(t *testing.T) {
+	r := NewRegistry(nil)
+	if strings.Contains(render(t, r), "hedge_build_info") {
+		t.Error("hedge_build_info should not be emitted before SetBuildInfo")
+	}
+}
+
 func TestInFlightGaugeReadsLive(t *testing.T) {
 	r := NewRegistry(nil)
 	live := 0
