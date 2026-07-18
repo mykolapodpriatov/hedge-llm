@@ -114,7 +114,7 @@ Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDG
 
 ### Adaptive timing
 
-With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer of each backend's recent first-token latencies and can suggest a `fire_after` from the primary's recent p50 — waiting roughly as long as the primary usually takes before hedging. Statistics are in-memory only (no persistence) and bounded to `window` samples per backend. Off by default (static `fire_after`).
+With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer of each backend's recent first-token latencies and derives **each request's** `fire_after` from the primary's recent p50 — waiting roughly as long as the primary usually takes before hedging. Until the primary has collected `min_samples` samples the static `fire_after` is used; once enough samples exist, its p50 governs when the first backup fires. Statistics are in-memory only (no persistence) and bounded to `window` samples per backend. Off by default (static `fire_after`).
 
 ## Metrics
 
@@ -123,7 +123,9 @@ With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `hedge_requests_total` | counter | Chat-completion requests handled. |
+| `hedge_requests_failed_total` | counter | Requests that produced no winner (every backend failed → the client got a 502). |
 | `hedge_backend_wins_total{backend}` | counter | Requests won, per backend. |
+| `hedge_backend_losses_total{backend,reason}` | counter | Requests lost, per backend, by `reason` (`error`, `no_usable_token`, `canceled`) — so per-backend loss/error rate is computable. Cardinality is bounded to backends × 3. |
 | `hedge_redundant_requests_total` | counter | Speculative backups started beyond the primary. |
 | `hedge_first_token_latency_seconds` | histogram | First-token latency distribution. |
 | `hedge_latency_saved_seconds_total` | counter | Estimated cumulative first-token latency saved by hedging. |

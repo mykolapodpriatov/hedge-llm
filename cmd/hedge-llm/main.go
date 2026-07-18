@@ -57,20 +57,32 @@ func run() error {
 	}
 
 	backends := cfg.BuildBackends(httpClient)
-	engine := hedge.NewEngine(backends, cfg.HedgePolicy(), clock.RealClock{})
 
 	reg := metrics.NewRegistry(nil)
+
+	// Adaptive timing (opt-in): a single estimator both records per-backend
+	// first-token latencies (via the proxy's LatencyObserver) and supplies the
+	// engine's per-run fire-after from the primary's recent p50, falling back to
+	// the static fire_after until min_samples are collected.
+	var engineOpts []hedge.Option
+	proxyOpts := []proxy.Option{proxy.WithMetrics(reg)}
+	if cfg.Adaptive.Enabled {
+		est := adaptive.NewEstimator(cfg.Adaptive.Window)
+		staticFireAfter := cfg.HedgePolicy().FireAfter
+		minSamples := cfg.Adaptive.MinSamples
+		proxyOpts = append(proxyOpts, proxy.WithLatencyObserver(est))
+		engineOpts = append(engineOpts, hedge.WithFireAfterFunc(func(primary string) time.Duration {
+			return est.SuggestFireAfter(primary, staticFireAfter, minSamples)
+		}))
+		log.Printf("hedge-llm: adaptive timing enabled (window=%d, min_samples=%d)", cfg.Adaptive.Window, cfg.Adaptive.MinSamples)
+	}
+
+	engine := hedge.NewEngine(backends, cfg.HedgePolicy(), clock.RealClock{}, engineOpts...)
 	// Single source of truth for the inflight gauge: the engine's mutex-guarded
 	// counter, read at scrape time.
 	reg.SetInFlightFunc(engine.InFlight)
 
-	opts := []proxy.Option{proxy.WithMetrics(reg)}
-	if cfg.Adaptive.Enabled {
-		est := adaptive.NewEstimator(cfg.Adaptive.Window)
-		opts = append(opts, proxy.WithLatencyObserver(est))
-		log.Printf("hedge-llm: adaptive timing enabled (window=%d)", cfg.Adaptive.Window)
-	}
-	handler := proxy.NewHandler(engine, opts...)
+	handler := proxy.NewHandler(engine, proxyOpts...)
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/chat/completions", handler)

@@ -26,8 +26,10 @@ import (
 // without importing the metrics package directly (keeps the dependency one-way).
 type MetricsReporter interface {
 	IncRequests()
+	IncFailedRequests()
 	AddRedundantRequests(n int)
 	ObserveWin(backend string)
+	ObserveLoss(backend, reason string)
 	ObserveFirstToken(d time.Duration)
 	AddLatencySaved(d time.Duration)
 }
@@ -178,10 +180,16 @@ func (h *Handler) writeUncommittedError(w http.ResponseWriter, err error) {
 func (h *Handler) report(o hedge.Outcome, _ *oapi.Request) {
 	if h.metrics != nil {
 		h.metrics.AddRedundantRequests(o.RedundantStarts())
+		for _, l := range o.Losses {
+			h.metrics.ObserveLoss(l.Backend, l.Reason)
+		}
 		if o.Winner != "" {
 			h.metrics.ObserveWin(o.Winner)
 			h.metrics.ObserveFirstToken(o.FirstTokenLatency)
 			h.metrics.AddLatencySaved(o.LatencySaved())
+		} else {
+			// No winner: every backend failed and the client gets an error.
+			h.metrics.IncFailedRequests()
 		}
 	}
 	if h.latency != nil && o.Winner != "" && o.FirstTokenLatency > 0 {

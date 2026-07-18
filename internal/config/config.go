@@ -179,6 +179,12 @@ func (c Config) Validate() error {
 	if c.Policy.CostCeiling < 0 {
 		return fmt.Errorf("hedge-llm: config: policy.cost_ceiling must be >= 0")
 	}
+	if c.Adaptive.Window < 0 {
+		return fmt.Errorf("hedge-llm: config: adaptive.window must be >= 0")
+	}
+	if c.Adaptive.MinSamples < 0 {
+		return fmt.Errorf("hedge-llm: config: adaptive.min_samples must be >= 0")
+	}
 	return nil
 }
 

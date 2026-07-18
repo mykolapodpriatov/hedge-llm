@@ -93,6 +93,8 @@ func TestValidateErrors(t *testing.T) {
 		{"bad max_in_flight", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 0}}},
 		{"neg fire_after", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, FireAfterMS: -5}}},
 		{"neg ceiling", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, CostCeiling: -1}}},
+		{"neg adaptive window", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{Window: -1}}},
+		{"neg adaptive min_samples", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{MinSamples: -1}}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

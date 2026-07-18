@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"hedge-llm/internal/adaptive"
 	"hedge-llm/internal/backend"
 	"hedge-llm/internal/clock"
 	"hedge-llm/internal/metrics"
@@ -949,6 +950,192 @@ func TestSingleBackendStartErrorReturnsPromptly(t *testing.T) {
 	}
 	if got := e.InFlight(); got != 0 {
 		t.Errorf("inFlight=%d after run, want 0", got)
+	}
+}
+
+// Issue #2: the engine consults a WithFireAfterFunc option once per Run to
+// derive the fire-after delay, so a seeded adaptive estimator's p50 — not the
+// static policy.FireAfter — times the backup start. Below the estimator's
+// min_samples the suggestion falls back to the static value, and with no
+// function installed adaptive timing is off entirely.
+//
+// The scenario is chosen so the fire-after delay alone decides the winner: the
+// primary is slow (200ms first token) while a backup that starts EARLY (at the
+// 20ms p50) produces at 30ms and wins, but a backup gated on the huge static
+// delay never starts and the slow primary wins.
+func TestFireAfterFuncDrivesBackupStart(t *testing.T) {
+	const (
+		staticFireAfter = time.Hour // static value → backup would never fire in test time
+		p50             = 20 * time.Millisecond
+		minSamples      = 5
+	)
+	newBackends := func(clk *clock.FakeClock) []backend.Backend {
+		primary := &backend.FakeBackend{
+			BackendName: "primary", Clock: clk,
+			FirstTokenDelay: 200 * time.Millisecond,
+			Tokens:          []string{"P"}, EmitFinish: true,
+		}
+		backup := &backend.FakeBackend{
+			BackendName: "backup", Clock: clk,
+			FirstTokenDelay: 10 * time.Millisecond,
+			Tokens:          []string{"B"}, EmitFinish: true,
+		}
+		return []backend.Backend{primary, backup}
+	}
+	// A seeded estimator whose primary p50 is exactly p50 (constant samples).
+	seededEstimator := func(samples int) *adaptive.Estimator {
+		est := adaptive.NewEstimator(64)
+		for i := 0; i < samples; i++ {
+			est.Observe("primary", p50)
+		}
+		return est
+	}
+	// The static policy fire-after is huge, so ANY early backup start must come
+	// from the adaptive suggestion, not the policy.
+	pol := policy.HedgePolicy{FireAfter: staticFireAfter, MaxInFlight: 2}
+	// Mirror exactly how cmd/hedge-llm wires the estimator into the engine.
+	fireAfterFunc := func(est *adaptive.Estimator) func(string) time.Duration {
+		return func(primary string) time.Duration {
+			return est.SuggestFireAfter(primary, staticFireAfter, minSamples)
+		}
+	}
+
+	t.Run("p50 times the backup start at/above min_samples", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		est := seededEstimator(minSamples + 1) // enough samples → suggestion is the p50
+		e := NewEngine(newBackends(clk), pol, clk, WithFireAfterFunc(fireAfterFunc(est)))
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		// The backup fired at the p50 (20ms) and produced (30ms) before the
+		// primary's 200ms first token → backup wins and TWO backends started.
+		if o.Winner != "backup" {
+			t.Errorf("winner=%q want backup (backup must fire at the adaptive p50, not the static value)", o.Winner)
+		}
+		if o.Started != 2 {
+			t.Errorf("started=%d want 2 (adaptive fire-after started the backup)", o.Started)
+		}
+	})
+
+	t.Run("below min_samples falls back to the static fire_after", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		est := seededEstimator(minSamples - 3) // too few samples → suggestion is the static value
+		e := NewEngine(newBackends(clk), pol, clk, WithFireAfterFunc(fireAfterFunc(est)))
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		// With the static (huge) fire-after the backup never starts; the primary's
+		// 200ms token wins and only ONE backend started.
+		if o.Winner != "primary" {
+			t.Errorf("winner=%q want primary (below min_samples must use the static fire_after)", o.Winner)
+		}
+		if o.Started != 1 {
+			t.Errorf("started=%d want 1 (static fire_after must not start the backup)", o.Started)
+		}
+	})
+
+	t.Run("adaptive off by default (no fire-after func)", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		// A fully-seeded estimator exists but is NOT wired into the engine, so its
+		// p50 must be ignored and the static fire_after governs.
+		_ = seededEstimator(minSamples + 1)
+		e := NewEngine(newBackends(clk), pol, clk) // no WithFireAfterFunc
+
+		d := startDriver(clk, 2*time.Millisecond)
+		defer d.Stop()
+
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if o.Winner != "primary" || o.Started != 1 {
+			t.Errorf("winner=%q started=%d want primary/1 (adaptive must be off by default)", o.Winner, o.Started)
+		}
+	})
+}
+
+// Issue #3: every started, non-winning backend is recorded in Outcome.Losses
+// with the right {backend, reason}. A backend that errors on Stream records
+// "error"; one that closes with no usable token records "no_usable_token"; the
+// winner never appears. The pairs flow to the metrics exposition unchanged.
+func TestPerBackendLossReasonsRecorded(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	errBE := &backend.FakeBackend{
+		BackendName: "erroring", Clock: clk,
+		StartErr: errors.New("connect failed"),
+	}
+	notok := &backend.FakeBackend{
+		BackendName: "no-token", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          nil, EmitFinish: true, // closes with no usable token
+	}
+	win := &backend.FakeBackend{
+		BackendName: "winner", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          []string{"W"}, EmitFinish: true,
+	}
+	// fire_after huge → loss-driven progression: each loss starts the next
+	// backend, so all three states are exercised in order.
+	pol := policy.HedgePolicy{FireAfter: time.Hour, MaxInFlight: 3}
+	e := NewEngine([]backend.Backend{errBE, notok, win}, pol, clk)
+
+	d := startDriver(clk, time.Millisecond)
+	defer d.Stop()
+
+	o, err := runEngine(t, e, context.Background(), &captureSink{})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if o.Winner != "winner" {
+		t.Fatalf("winner=%q want winner", o.Winner)
+	}
+
+	got := map[string]string{}
+	for _, l := range o.Losses {
+		if prev, dup := got[l.Backend]; dup {
+			t.Errorf("duplicate loss for %q (had %q, now %q)", l.Backend, prev, l.Reason)
+		}
+		got[l.Backend] = l.Reason
+	}
+	if got["erroring"] != LossReasonError {
+		t.Errorf("erroring reason=%q want %q", got["erroring"], LossReasonError)
+	}
+	if got["no-token"] != LossReasonNoUsableToken {
+		t.Errorf("no-token reason=%q want %q", got["no-token"], LossReasonNoUsableToken)
+	}
+	if _, ok := got["winner"]; ok {
+		t.Errorf("winner must not appear in losses: %+v", o.Losses)
+	}
+	if len(o.Losses) != 2 {
+		t.Errorf("losses=%d want 2 (the two non-winning backends)", len(o.Losses))
+	}
+
+	// The {backend,reason} pairs flow to the metrics exposition exactly as the
+	// proxy feeds them.
+	reg := metrics.NewRegistry(nil)
+	for _, l := range o.Losses {
+		reg.ObserveLoss(l.Backend, l.Reason)
+	}
+	var sb strings.Builder
+	if _, err := reg.WriteTo(&sb); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	text := sb.String()
+	if !strings.Contains(text, `hedge_backend_losses_total{backend="erroring",reason="error"} 1`) {
+		t.Errorf("missing erroring loss series:\n%s", text)
+	}
+	if !strings.Contains(text, `hedge_backend_losses_total{backend="no-token",reason="no_usable_token"} 1`) {
+		t.Errorf("missing no-token loss series:\n%s", text)
 	}
 }
 

@@ -157,7 +157,8 @@ func TestExpositionTypesAndCounters(t *testing.T) {
 
 	// Every metric must have HELP and TYPE.
 	for _, name := range []string{
-		"hedge_requests_total", "hedge_backend_wins_total",
+		"hedge_requests_total", "hedge_requests_failed_total",
+		"hedge_backend_wins_total", "hedge_backend_losses_total",
 		"hedge_redundant_requests_total", "hedge_latency_saved_seconds_total",
 		"hedge_first_token_latency_seconds", "hedge_inflight",
 	} {
@@ -201,6 +202,74 @@ func TestBackendWinsSortedAndQuoted(t *testing.T) {
 	// Quoting: the weird name's quote must be escaped in the raw text.
 	if !strings.Contains(text, `backend="weird\"name"`) {
 		t.Errorf("label value not properly quoted/escaped:\n%s", text)
+	}
+}
+
+func TestBackendLossesSortedQuotedAndBounded(t *testing.T) {
+	r := NewRegistry(nil)
+	// Two backends across the fixed reason set, plus a weird name to test quoting.
+	r.ObserveLoss("beta", "canceled")
+	r.ObserveLoss("beta", "error")
+	r.ObserveLoss("alpha", "no_usable_token")
+	r.ObserveLoss("alpha", "no_usable_token") // same series → value 2 (cardinality bound)
+	r.ObserveLoss("alpha", "error")
+	r.ObserveLoss(`weird"name`, "canceled")
+
+	text := render(t, r)
+	p := parseExposition(t, text)
+
+	type br struct{ backend, reason string }
+	var order []br
+	for _, s := range p.samples {
+		if s.name == "hedge_backend_losses_total" {
+			order = append(order, br{s.labels["backend"], s.labels["reason"]})
+		}
+	}
+	if len(order) == 0 {
+		t.Fatal("no loss series emitted")
+	}
+	// Series must be sorted by (backend, then reason).
+	for i := 1; i < len(order); i++ {
+		a, b := order[i-1], order[i]
+		if a.backend > b.backend || (a.backend == b.backend && a.reason > b.reason) {
+			t.Errorf("loss series not sorted by (backend,reason): %v", order)
+		}
+	}
+	// A repeated observation accumulates on ONE series (cardinality is bounded to
+	// distinct backend×reason pairs, never one series per event).
+	if got := sampleValue(p, "hedge_backend_losses_total", map[string]string{"backend": "alpha", "reason": "no_usable_token"}); got != "2" {
+		t.Errorf("alpha/no_usable_token=%s want 2", got)
+	}
+	seen := map[br]bool{}
+	for _, o := range order {
+		seen[o] = true
+	}
+	if len(order) != len(seen) {
+		t.Errorf("duplicate series emitted (cardinality unbounded?): %v", order)
+	}
+	if len(seen) != 5 {
+		t.Errorf("distinct loss series=%d want 5 (backends × reasons observed)", len(seen))
+	}
+	// Quoting: the weird name's quote must be escaped in the raw text, with the
+	// reason label present alongside it.
+	if !strings.Contains(text, `backend="weird\"name",reason="canceled"`) {
+		t.Errorf("label value not properly quoted/escaped:\n%s", text)
+	}
+	if p.typ["hedge_backend_losses_total"] != "counter" {
+		t.Errorf("losses type=%q", p.typ["hedge_backend_losses_total"])
+	}
+}
+
+func TestRequestsFailedCounter(t *testing.T) {
+	r := NewRegistry(nil)
+	r.IncFailedRequests()
+	r.IncFailedRequests()
+	p := parseExposition(t, render(t, r))
+	if p.typ["hedge_requests_failed_total"] != "counter" {
+		t.Errorf("requests_failed type=%q", p.typ["hedge_requests_failed_total"])
+	}
+	if got := sampleValue(p, "hedge_requests_failed_total", nil); got != "2" {
+		t.Errorf("requests_failed=%s want 2", got)
 	}
 }
 
