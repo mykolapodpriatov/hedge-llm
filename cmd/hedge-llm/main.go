@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -92,6 +93,7 @@ func run(args []string, out io.Writer) error {
 	backends := cfg.BuildBackends(httpClient)
 
 	reg := metrics.NewRegistry(nil)
+	reg.SetBuildInfo(version, runtime.Version())
 
 	// Adaptive timing (opt-in): a single estimator both records per-backend
 	// first-token latencies (via the proxy's LatencyObserver) and supplies the
