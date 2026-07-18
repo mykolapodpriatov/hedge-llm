@@ -100,7 +100,9 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("hedge-llm: parse config %q: %w", path, err)
 		}
 	}
-	applyEnvOverrides(&cfg)
+	if err := applyEnvOverrides(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -108,29 +110,39 @@ func Load(path string) (Config, error) {
 }
 
 // applyEnvOverrides applies HEDGE_LLM_* environment overrides for the scalar,
-// operationally-relevant settings. Backend lists are file-driven.
-func applyEnvOverrides(cfg *Config) {
+// operationally-relevant settings. Backend lists are file-driven. A numeric
+// override that fails to parse is reported as an error rather than silently
+// dropped, so an operator typo surfaces at startup instead of masquerading as
+// the default value.
+func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("HEDGE_LLM_LISTEN_ADDR"); v != "" {
 		cfg.ListenAddr = v
 	}
 	if v := os.Getenv("HEDGE_LLM_FIRE_AFTER_MS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Policy.FireAfterMS = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("hedge-llm: config: HEDGE_LLM_FIRE_AFTER_MS=%q is not an integer: %w", v, err)
 		}
+		cfg.Policy.FireAfterMS = n
 	}
 	if v := os.Getenv("HEDGE_LLM_MAX_IN_FLIGHT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Policy.MaxInFlight = n
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("hedge-llm: config: HEDGE_LLM_MAX_IN_FLIGHT=%q is not an integer: %w", v, err)
 		}
+		cfg.Policy.MaxInFlight = n
 	}
 	if v := os.Getenv("HEDGE_LLM_COST_CEILING"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			cfg.Policy.CostCeiling = f
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("hedge-llm: config: HEDGE_LLM_COST_CEILING=%q is not a number: %w", v, err)
 		}
+		cfg.Policy.CostCeiling = f
 	}
 	if v := os.Getenv("HEDGE_LLM_ADAPTIVE"); v != "" {
 		cfg.Adaptive.Enabled = isTruthy(v)
 	}
+	return nil
 }
 
 func isTruthy(v string) bool {
