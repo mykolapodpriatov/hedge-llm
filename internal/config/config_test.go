@@ -78,6 +78,64 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadListenAPIKeyEnvField(t *testing.T) {
+	path := writeTemp(t, `{
+		"listen_addr": ":8080",
+		"backends": [{"name":"a","base_url":"http://x/v1","model":"m","cost_per_request":1}],
+		"policy": {"fire_after_ms": 250, "max_in_flight": 2},
+		"listen_api_key_env": "MY_INBOUND_KEY_VAR"
+	}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ListenAPIKeyEnv != "MY_INBOUND_KEY_VAR" {
+		t.Errorf("ListenAPIKeyEnv=%q want MY_INBOUND_KEY_VAR", cfg.ListenAPIKeyEnv)
+	}
+}
+
+func TestListenAPIKeyResolvesFromNamedEnvVar(t *testing.T) {
+	t.Setenv("MY_INBOUND_KEY_VAR", "sk-inbound-secret")
+	cfg := Config{ListenAPIKeyEnv: "MY_INBOUND_KEY_VAR"}
+	if got := cfg.ListenAPIKey(); got != "sk-inbound-secret" {
+		t.Errorf("ListenAPIKey()=%q want sk-inbound-secret", got)
+	}
+}
+
+func TestListenAPIKeyDisabledByDefault(t *testing.T) {
+	cfg := Default()
+	if got := cfg.ListenAPIKey(); got != "" {
+		t.Errorf("ListenAPIKey()=%q want empty (auth disabled by default)", got)
+	}
+}
+
+func TestListenAPIKeyEmptyWhenNamedVarUnset(t *testing.T) {
+	cfg := Config{ListenAPIKeyEnv: "HEDGE_LLM_TEST_DEFINITELY_UNSET_VAR"}
+	if got := cfg.ListenAPIKey(); got != "" {
+		t.Errorf("ListenAPIKey()=%q want empty when named env var is unset", got)
+	}
+}
+
+func TestLoadEnvOverrideAPIKey(t *testing.T) {
+	path := writeTemp(t, `{
+		"listen_addr": ":8080",
+		"backends": [{"name":"a","base_url":"http://x/v1","model":"m","cost_per_request":1}],
+		"policy": {"fire_after_ms": 250, "max_in_flight": 2}
+	}`)
+	t.Setenv("HEDGE_LLM_API_KEY", "sk-override-secret")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ListenAPIKeyEnv != "HEDGE_LLM_API_KEY" {
+		t.Errorf("ListenAPIKeyEnv=%q want HEDGE_LLM_API_KEY", cfg.ListenAPIKeyEnv)
+	}
+	if got := cfg.ListenAPIKey(); got != "sk-override-secret" {
+		t.Errorf("ListenAPIKey()=%q want sk-override-secret", got)
+	}
+}
+
 func TestLoadMalformedEnvOverrides(t *testing.T) {
 	const validCfg = `{
 		"listen_addr": ":8080",
