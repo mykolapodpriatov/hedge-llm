@@ -60,6 +60,14 @@ type Config struct {
 	Policy PolicyConfig `json:"policy"`
 	// Adaptive configures adaptive timing.
 	Adaptive AdaptiveConfig `json:"adaptive"`
+	// ListenAPIKeyEnv optionally names an environment variable holding the
+	// daemon's own inbound API key (the key itself is never stored in the
+	// config file, same convention as BackendConfig.APIKeyEnv). When set and
+	// the named variable holds a non-empty value, /v1/chat/completions
+	// requires a matching "Authorization: Bearer <key>" header and rejects
+	// everything else with 401. Unset/empty (the default) keeps today's open
+	// behavior, so existing deployments need no changes.
+	ListenAPIKeyEnv string `json:"listen_api_key_env"`
 }
 
 // Default returns a Config with sensible defaults and no backends.
@@ -73,6 +81,18 @@ func Default() Config {
 		},
 		Adaptive: AdaptiveConfig{Enabled: false, Window: 128, MinSamples: 10},
 	}
+}
+
+// ListenAPIKey resolves the daemon's own inbound API key from
+// ListenAPIKeyEnv, if configured. It returns "" — meaning inbound auth is
+// disabled — when ListenAPIKeyEnv is empty or the named environment variable
+// is unset/empty, so a bare "the name is set but nothing exports it yet"
+// deployment fails open rather than locking every client out.
+func (c Config) ListenAPIKey() string {
+	if strings.TrimSpace(c.ListenAPIKeyEnv) == "" {
+		return ""
+	}
+	return os.Getenv(c.ListenAPIKeyEnv)
 }
 
 // HedgePolicy converts the JSON policy into a runtime policy.HedgePolicy.
@@ -141,6 +161,13 @@ func applyEnvOverrides(cfg *Config) error {
 	}
 	if v := os.Getenv("HEDGE_LLM_ADAPTIVE"); v != "" {
 		cfg.Adaptive.Enabled = isTruthy(v)
+	}
+	// HEDGE_LLM_API_KEY is the convenience zero-config path: point
+	// ListenAPIKeyEnv at it (rather than copying its value into Config) so the
+	// actual key still never lives on the struct, matching the
+	// never-store-secrets-in-config convention used for backend keys.
+	if v := os.Getenv("HEDGE_LLM_API_KEY"); v != "" {
+		cfg.ListenAPIKeyEnv = "HEDGE_LLM_API_KEY"
 	}
 	return nil
 }

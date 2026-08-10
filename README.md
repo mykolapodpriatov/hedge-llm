@@ -91,14 +91,24 @@ Configuration is a JSON file; a few operational knobs can be overridden by envir
     }
   ],
   "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0 },
-  "adaptive": { "enabled": false, "window": 128, "min_samples": 10 }
+  "adaptive": { "enabled": false, "window": 128, "min_samples": 10 },
+  "listen_api_key_env": ""
 }
 ```
 
 - Backends are tried in order; the **first is the primary**. API keys are read from the named environment variable and never stored in the file (omit `api_key_env` for keyless upstreams like a local Ollama).
 - `v1` targets **OpenAI-compatible** streaming upstreams (OpenAI, Azure OpenAI, vLLM, Ollama's `/v1`, …). Anthropic/Gemini normalization is a documented extension point.
 
-Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDGE_LLM_MAX_IN_FLIGHT`, `HEDGE_LLM_COST_CEILING`, `HEDGE_LLM_ADAPTIVE`.
+Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDGE_LLM_MAX_IN_FLIGHT`, `HEDGE_LLM_COST_CEILING`, `HEDGE_LLM_ADAPTIVE`, `HEDGE_LLM_API_KEY`.
+
+### Inbound authentication
+
+`hedge-llm` holds real, paid backend API keys, so anything that can reach `listen_addr` can spend them — fine for `localhost:8080`, not fine once the daemon is reachable from a LAN/VPN/container network. Inbound auth is **off by default** (unchanged behavior) and opt-in via either of:
+
+- `listen_api_key_env` in the config file, naming an environment variable that holds the daemon's own inbound key, e.g. `"listen_api_key_env": "HEDGE_LLM_INBOUND_KEY"` with `HEDGE_LLM_INBOUND_KEY=sk-...` exported wherever the daemon runs.
+- The `HEDGE_LLM_API_KEY` environment variable directly — no config file change needed. Export it and clients must send it.
+
+Once configured, every request to `/v1/chat/completions` must include `Authorization: Bearer <key>`; a missing or mismatched header gets a `401` with an OpenAI-style `invalid_api_key` error, before the request body is even read. Leave both unset and the daemon stays open, exactly as it behaves today.
 
 ### Policy knobs
 

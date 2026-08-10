@@ -24,5 +24,6 @@
     "enabled": false,
     "window": 128,
     "min_samples": 10
-  }
+  },
+  "listen_api_key_env": ""
 }

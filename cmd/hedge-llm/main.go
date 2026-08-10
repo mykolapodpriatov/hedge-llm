@@ -101,6 +101,10 @@ func run(args []string, out io.Writer) error {
 	// the static fire_after until min_samples are collected.
 	var engineOpts []hedge.Option
 	proxyOpts := []proxy.Option{proxy.WithMetrics(reg)}
+	if listenKey := cfg.ListenAPIKey(); listenKey != "" {
+		proxyOpts = append(proxyOpts, proxy.WithAPIKey(listenKey))
+		log.Printf("hedge-llm: inbound API key auth enabled (listen_api_key_env=%s)", cfg.ListenAPIKeyEnv)
+	}
 	if cfg.Adaptive.Enabled {
 		est := adaptive.NewEstimator(cfg.Adaptive.Window)
 		staticFireAfter := cfg.HedgePolicy().FireAfter

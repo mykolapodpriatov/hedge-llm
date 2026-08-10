@@ -384,6 +384,130 @@ func TestNoBackendsReturnsServiceUnavailable(t *testing.T) {
 	}
 }
 
+func TestAuthRejectsMissingHeader(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, Tokens: []string{"x"}}
+	e := hedge.NewEngine([]backend.Backend{primary}, policy.DefaultPolicy(), clk)
+	h := NewHandler(e, WithAPIKey("sk-secret"))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// No Authorization header at all.
+	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(postBody(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status=%d want 401", resp.StatusCode)
+	}
+	var eb oapi.ErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb.Error.Code != "invalid_api_key" {
+		t.Errorf("error code=%q want invalid_api_key", eb.Error.Code)
+	}
+	if eb.Error.Type != "invalid_request_error" {
+		t.Errorf("error type=%q want invalid_request_error", eb.Error.Type)
+	}
+}
+
+func TestAuthRejectsWrongKey(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, Tokens: []string{"x"}}
+	e := hedge.NewEngine([]backend.Backend{primary}, policy.DefaultPolicy(), clk)
+	h := NewHandler(e, WithAPIKey("sk-secret"))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(postBody(false)))
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status=%d want 401", resp.StatusCode)
+	}
+}
+
+func TestAuthRejectsMalformedHeader(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, Tokens: []string{"x"}}
+	e := hedge.NewEngine([]backend.Backend{primary}, policy.DefaultPolicy(), clk)
+	h := NewHandler(e, WithAPIKey("sk-secret"))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Right key, wrong scheme.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(postBody(false)))
+	req.Header.Set("Authorization", "sk-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status=%d want 401", resp.StatusCode)
+	}
+}
+
+func TestAuthAllowsCorrectKey(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{
+		BackendName: "p", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          []string{"hi"}, EmitFinish: true,
+	}
+	e := hedge.NewEngine([]backend.Backend{primary}, policy.HedgePolicy{FireAfter: time.Second, MaxInFlight: 1}, clk)
+	h := NewHandler(e, WithAPIKey("sk-secret"))
+
+	stop := driveClock(clk, 2*time.Millisecond)
+	defer stop()
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(postBody(false)))
+	req.Header.Set("Authorization", "Bearer sk-secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status=%d want 200", resp.StatusCode)
+	}
+}
+
+func TestAuthDisabledByDefaultAllowsNoHeader(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{
+		BackendName: "p", Clock: clk,
+		FirstTokenDelay: 5 * time.Millisecond,
+		Tokens:          []string{"hi"}, EmitFinish: true,
+	}
+	e := hedge.NewEngine([]backend.Backend{primary}, policy.HedgePolicy{FireAfter: time.Second, MaxInFlight: 1}, clk)
+	h := NewHandler(e) // no WithAPIKey: auth stays off, matching pre-issue-9 behavior.
+
+	stop := driveClock(clk, 2*time.Millisecond)
+	defer stop()
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(postBody(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status=%d want 200 (auth disabled by default)", resp.StatusCode)
+	}
+}
+
 func TestMaxRequestBytesTruncatesToInvalid(t *testing.T) {
 	clk := clock.NewFakeClock(time.Time{})
 	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, Tokens: []string{"x"}}

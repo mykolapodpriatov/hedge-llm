@@ -11,6 +11,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -46,6 +47,7 @@ type Handler struct {
 	metrics  MetricsReporter
 	latency  LatencyObserver
 	maxBytes int64
+	apiKey   string
 }
 
 // Option configures a Handler.
@@ -57,6 +59,11 @@ func WithMetrics(m MetricsReporter) Option { return func(h *Handler) { h.metrics
 // WithLatencyObserver installs a per-backend first-token latency observer
 // (adaptive timing).
 func WithLatencyObserver(l LatencyObserver) Option { return func(h *Handler) { h.latency = l } }
+
+// WithAPIKey requires clients to authenticate with a matching
+// "Authorization: Bearer <key>" header. An empty key (the default) disables
+// the check entirely, keeping the handler open — today's behavior.
+func WithAPIKey(key string) Option { return func(h *Handler) { h.apiKey = key } }
 
 // WithMaxRequestBytes caps the accepted request body size (default 1 MiB).
 func WithMaxRequestBytes(n int64) Option {
@@ -78,6 +85,11 @@ func NewHandler(engine *hedge.Engine, opts ...Option) *Handler {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.apiKey != "" && !h.authorized(r) {
+		writeError(w, http.StatusUnauthorized,
+			"missing or invalid API key", "invalid_request_error", "invalid_api_key")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
@@ -106,6 +118,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.serveJSON(w, r, req)
+}
+
+// authorized reports whether r carries an "Authorization: Bearer <key>"
+// header matching h.apiKey. The token comparison is constant-time so the
+// configured key can't be recovered by timing a series of guesses.
+func (h *Handler) authorized(r *http.Request) bool {
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	if len(auth) < len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
+		return false
+	}
+	token := auth[len(prefix):]
+	return subtle.ConstantTimeCompare([]byte(token), []byte(h.apiKey)) == 1
 }
 
 // serveStream handles a streaming (SSE) request. It asserts http.Flusher at the
