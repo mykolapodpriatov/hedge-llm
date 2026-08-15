@@ -28,15 +28,23 @@ type HedgePolicy struct {
 	// MaxInFlight applies). See the README for the honest semantics: this caps
 	// how many duplicate requests may be launched, not the upstream token bill.
 	CostCeiling float64
+
+	// RequestTimeout is a ceiling on time-to-winner for a single Run. If no
+	// backend produces a usable token within this budget the race ends as
+	// all-failed and still-running backends are cancelled. A value <= 0
+	// disables the ceiling (today's behavior). The bound does not abort an
+	// already-committed winner stream.
+	RequestTimeout time.Duration
 }
 
 // DefaultPolicy returns a conservative starting policy: hedge a single backup
 // after 250ms, at most two backends in flight, no cost gate.
 func DefaultPolicy() HedgePolicy {
 	return HedgePolicy{
-		FireAfter:   250 * time.Millisecond,
-		MaxInFlight: 2,
-		CostCeiling: 0,
+		FireAfter:      250 * time.Millisecond,
+		MaxInFlight:    2,
+		CostCeiling:    0,
+		RequestTimeout: 0,
 	}
 }
 

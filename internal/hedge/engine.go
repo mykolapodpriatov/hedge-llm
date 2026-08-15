@@ -246,14 +246,16 @@ type run struct {
 }
 
 // Run executes one hedged request. It blocks until a winner has been fully
-// relayed to the sink, until all backends have lost, or until clientCtx is
+// relayed to the sink, until all backends have lost, until the optional
+// request-timeout ceiling elapses with no winner, or until clientCtx is
 // cancelled — and only returns AFTER cancelling every child context and waiting
 // for all backend goroutines to drain (cancel-before-wait).
 //
 // On success Run returns the Outcome and a nil error. If no backend produces a
-// usable token it returns ErrAllBackendsFailed. If clientCtx is cancelled before
-// a winner it returns the context error. If the sink reports a write error
-// mid-relay (response already committed), that error is returned.
+// usable token — including when the request-timeout ceiling fires — it returns
+// ErrAllBackendsFailed. If clientCtx is cancelled before a winner it returns
+// the context error. If the sink reports a write error mid-relay (response
+// already committed), that error is returned.
 func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (Outcome, error) {
 	if len(e.backends) == 0 {
 		return Outcome{}, ErrNoBackends
@@ -480,6 +482,19 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// Start the primary.
 	r.startNext()
 
+	// Optional time-to-winner ceiling, layered over the client context the same
+	// way context.WithTimeout would be: when it fires the race ends, Run's
+	// cancel-before-wait tears every child down, and still-running backends
+	// record LossReasonCanceled. Driven by e.clk so tests fire it via FakeClock
+	// with no real sleeps, and so an already-committed winner stream is not
+	// aborted (the timer is only selected in this pre-winner loop). 0 disables.
+	var timeoutC <-chan time.Time
+	if e.pol.RequestTimeout > 0 {
+		timeoutTimer := e.clk.NewTimer(e.pol.RequestTimeout)
+		defer timeoutTimer.Stop()
+		timeoutC = timeoutTimer.C()
+	}
+
 	// ONE re-armable fire-after timer reused for the whole race (NOT a fresh
 	// timer per re-arm, which would leak abandoned *time.Timers). It starts
 	// stopped/disarmed; armFire Resets it, and it is Stopped when the race ends.
@@ -521,6 +536,12 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 			// parentCtx.Done(): client disconnect / shutdown. Return at once;
 			// Run cancels + waits. No speculative work survives.
 			return "", 0, primaryFirst, r.runCtx.Err()
+
+		case <-timeoutC:
+			// Time-to-winner ceiling hit with no winner. Return no winner so
+			// Run maps this onto the same ErrAllBackendsFailed path as an
+			// all-lose (502, uncommitted). cancelAll then Wait still run.
+			return "", 0, primaryFirst, nil
 
 		case <-fireTimer.C():
 			// Timer fired: start the next backup (check-and-increment inside),

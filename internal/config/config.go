@@ -34,9 +34,10 @@ type BackendConfig struct {
 // PolicyConfig is the JSON representation of a hedge policy (milliseconds for
 // the delay, to keep the file human-friendly).
 type PolicyConfig struct {
-	FireAfterMS int     `json:"fire_after_ms"`
-	MaxInFlight int     `json:"max_in_flight"`
-	CostCeiling float64 `json:"cost_ceiling"`
+	FireAfterMS      int     `json:"fire_after_ms"`
+	MaxInFlight      int     `json:"max_in_flight"`
+	CostCeiling      float64 `json:"cost_ceiling"`
+	RequestTimeoutMS int     `json:"request_timeout_ms"`
 }
 
 // AdaptiveConfig controls adaptive latency-aware timing.
@@ -75,9 +76,10 @@ func Default() Config {
 	return Config{
 		ListenAddr: ":8080",
 		Policy: PolicyConfig{
-			FireAfterMS: 250,
-			MaxInFlight: 2,
-			CostCeiling: 0,
+			FireAfterMS:      250,
+			MaxInFlight:      2,
+			CostCeiling:      0,
+			RequestTimeoutMS: 0,
 		},
 		Adaptive: AdaptiveConfig{Enabled: false, Window: 128, MinSamples: 10},
 	}
@@ -98,9 +100,10 @@ func (c Config) ListenAPIKey() string {
 // HedgePolicy converts the JSON policy into a runtime policy.HedgePolicy.
 func (c Config) HedgePolicy() policy.HedgePolicy {
 	return policy.HedgePolicy{
-		FireAfter:   time.Duration(c.Policy.FireAfterMS) * time.Millisecond,
-		MaxInFlight: c.Policy.MaxInFlight,
-		CostCeiling: c.Policy.CostCeiling,
+		FireAfter:      time.Duration(c.Policy.FireAfterMS) * time.Millisecond,
+		MaxInFlight:    c.Policy.MaxInFlight,
+		CostCeiling:    c.Policy.CostCeiling,
+		RequestTimeout: time.Duration(c.Policy.RequestTimeoutMS) * time.Millisecond,
 	}
 }
 
@@ -158,6 +161,13 @@ func applyEnvOverrides(cfg *Config) error {
 			return fmt.Errorf("hedge-llm: config: HEDGE_LLM_COST_CEILING=%q is not a number: %w", v, err)
 		}
 		cfg.Policy.CostCeiling = f
+	}
+	if v := os.Getenv("HEDGE_LLM_REQUEST_TIMEOUT_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("hedge-llm: config: HEDGE_LLM_REQUEST_TIMEOUT_MS=%q is not an integer: %w", v, err)
+		}
+		cfg.Policy.RequestTimeoutMS = n
 	}
 	if v := os.Getenv("HEDGE_LLM_ADAPTIVE"); v != "" {
 		cfg.Adaptive.Enabled = isTruthy(v)
@@ -217,6 +227,9 @@ func (c Config) Validate() error {
 	}
 	if c.Policy.CostCeiling < 0 {
 		return fmt.Errorf("hedge-llm: config: policy.cost_ceiling must be >= 0")
+	}
+	if c.Policy.RequestTimeoutMS < 0 {
+		return fmt.Errorf("hedge-llm: config: policy.request_timeout_ms must be >= 0")
 	}
 	if c.Adaptive.Window < 0 {
 		return fmt.Errorf("hedge-llm: config: adaptive.window must be >= 0")
