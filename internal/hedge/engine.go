@@ -144,6 +144,12 @@ func (o Outcome) LatencySaved() time.Duration {
 	return 0
 }
 
+// coolState tracks one backend's consecutive-loss streak and cooldown window.
+type coolState struct {
+	consecutive int       // consecutive losses since the last win or expiry
+	coolUntil   time.Time // zero if the backend is not cooling
+}
+
 // Engine runs hedged requests across a fixed ordered set of backends.
 type Engine struct {
 	backends []backend.Backend
@@ -162,6 +168,12 @@ type Engine struct {
 	mu            sync.Mutex
 	inFlight      int
 	committedCost float64
+
+	// coolMu guards coolState, the per-backend consecutive-loss / cooldown
+	// book. Distinct from mu so a /metrics scrape of Cooling never contends
+	// with the in-flight start decision.
+	coolMu    sync.Mutex
+	coolState map[string]*coolState
 }
 
 // Option configures an Engine at construction.
@@ -182,7 +194,12 @@ func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clo
 	if clk == nil {
 		clk = clock.RealClock{}
 	}
-	e := &Engine{backends: backends, pol: pol, clk: clk}
+	e := &Engine{
+		backends:  backends,
+		pol:       pol,
+		clk:       clk,
+		coolState: make(map[string]*coolState, len(backends)),
+	}
 	for _, o := range opts {
 		o(e)
 	}
@@ -191,13 +208,13 @@ func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clo
 
 // resolveFireAfter consults the optional per-run fire-after function once,
 // falling back to the static policy FireAfter when no function is installed or
-// it returns a non-positive duration. The primary is backends[0]; callers must
-// only invoke this when at least one backend exists.
-func (e *Engine) resolveFireAfter() time.Duration {
+// it returns a non-positive duration. primary is the name of this run's first
+// eligible backend; callers must only invoke this when at least one remains.
+func (e *Engine) resolveFireAfter(primary string) time.Duration {
 	if e.fireAfterFn == nil {
 		return e.pol.FireAfter
 	}
-	if d := e.fireAfterFn(e.backends[0].Name()); d > 0 {
+	if d := e.fireAfterFn(primary); d > 0 {
 		return d
 	}
 	return e.pol.FireAfter
@@ -210,6 +227,84 @@ func (e *Engine) InFlight() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.inFlight
+}
+
+// Cooling reports 0/1 per configured backend: 1 while that backend is inside
+// its loss-cooldown window and will be omitted from the next race. It is the
+// scrape-time source of truth for hedge_backend_cooling. Expiry is observed
+// here without mutating the streak (the next Run resets it).
+func (e *Engine) Cooling() map[string]int {
+	now := e.clk.Now()
+	e.coolMu.Lock()
+	defer e.coolMu.Unlock()
+	out := make(map[string]int, len(e.backends))
+	for _, be := range e.backends {
+		v := 0
+		if st := e.coolState[be.Name()]; st != nil && !st.coolUntil.IsZero() && now.Before(st.coolUntil) {
+			v = 1
+		}
+		out[be.Name()] = v
+	}
+	return out
+}
+
+// eligibleBackends returns the configured backends that may be dialed for the
+// next race. A backend still inside its cooldown window is omitted; an expired
+// window resets its consecutive-loss counter. When LossCooldownN is 0 the
+// full configured list is returned (today's behavior).
+func (e *Engine) eligibleBackends() []backend.Backend {
+	if e.pol.LossCooldownN <= 0 {
+		return e.backends
+	}
+	now := e.clk.Now()
+	e.coolMu.Lock()
+	defer e.coolMu.Unlock()
+	out := make([]backend.Backend, 0, len(e.backends))
+	for _, be := range e.backends {
+		st := e.coolState[be.Name()]
+		if st != nil && !st.coolUntil.IsZero() {
+			if now.Before(st.coolUntil) {
+				continue
+			}
+			st.consecutive = 0
+			st.coolUntil = time.Time{}
+		}
+		out = append(out, be)
+	}
+	return out
+}
+
+// recordOutcome updates consecutive-loss / cooldown state after a run. A win
+// resets that backend; each loss increments, and reaching LossCooldownN starts
+// a cooldown window. No-op when the feature is off.
+func (e *Engine) recordOutcome(o Outcome) {
+	if e.pol.LossCooldownN <= 0 {
+		return
+	}
+	now := e.clk.Now()
+	e.coolMu.Lock()
+	defer e.coolMu.Unlock()
+	if o.Winner != "" {
+		st := e.ensureCoolLocked(o.Winner)
+		st.consecutive = 0
+		st.coolUntil = time.Time{}
+	}
+	for _, l := range o.Losses {
+		st := e.ensureCoolLocked(l.Backend)
+		st.consecutive++
+		if st.consecutive >= e.pol.LossCooldownN {
+			st.coolUntil = now.Add(e.pol.LossCooldown)
+		}
+	}
+}
+
+func (e *Engine) ensureCoolLocked(name string) *coolState {
+	st := e.coolState[name]
+	if st == nil {
+		st = &coolState{}
+		e.coolState[name] = st
+	}
+	return st
 }
 
 // event is a fan-in message from a backend forwarder.
@@ -233,6 +328,7 @@ type backendState struct {
 // run holds the mutable state of a single Run invocation.
 type run struct {
 	e         *Engine
+	backends  []backend.Backend // eligible snapshot for this run (cooling omitted)
 	runCtx    context.Context
 	req       *oapi.Request
 	start     time.Time
@@ -260,15 +356,22 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 	if len(e.backends) == 0 {
 		return Outcome{}, ErrNoBackends
 	}
+	// Snapshot who may be dialed this race. Cooling backends are omitted so
+	// they do not burn cost_ceiling or add a dead-dial tail.
+	backends := e.eligibleBackends()
+	if len(backends) == 0 {
+		return Outcome{}, ErrNoBackends
+	}
 
 	runCtx, cancelAll := context.WithCancel(clientCtx)
 	var wg sync.WaitGroup
 	r := &run{
 		e:         e,
+		backends:  backends,
 		runCtx:    runCtx,
 		req:       req,
 		start:     e.clk.Now(),
-		fireAfter: e.resolveFireAfter(),
+		fireAfter: e.resolveFireAfter(backends[0].Name()),
 		winnerIdx: -1,
 		wg:        &wg,
 		// Buffer sized len(backends)*2 so each backend can have BOTH an in-flight
@@ -277,8 +380,8 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		// (e.g. a forwarder emitting an extra event) from deadlocking. Correctness
 		// still rests on the per-backend ctx.Done() select in the forwarder, not
 		// on the buffer.
-		events: make(chan event, len(e.backends)*2),
-		states: make([]*backendState, 0, len(e.backends)),
+		events: make(chan event, len(backends)*2),
+		states: make([]*backendState, 0, len(backends)),
 	}
 
 	winner, firstTok, primaryFirst, relayErr := r.race(sink)
@@ -300,6 +403,7 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		PrimaryFirstToken: primaryFirst,
 		Losses:            r.losses(),
 	}
+	e.recordOutcome(outcome)
 	if winner == "" && relayErr == nil {
 		relayErr = ErrAllBackendsFailed
 	}
@@ -373,10 +477,10 @@ func (r *run) committedCostDelta() float64 {
 // immediate loss.
 func (r *run) startNext() bool {
 	e := r.e
-	if r.nextIdx >= len(e.backends) {
+	if r.nextIdx >= len(r.backends) {
 		return false
 	}
-	be := e.backends[r.nextIdx]
+	be := r.backends[r.nextIdx]
 
 	e.mu.Lock()
 	// The first backend of THIS run is the primary and always starts. For
@@ -654,7 +758,7 @@ func (r *run) relay(sink Sink, winnerIdx int) error {
 }
 
 // hasMore reports whether at least one configured backend has not yet started.
-func (r *run) hasMore() bool { return r.nextIdx < len(r.e.backends) }
+func (r *run) hasMore() bool { return r.nextIdx < len(r.backends) }
 
 // producing reports the number of started backends whose stream has not yet
 // closed — i.e. backends that could still produce a usable token.
@@ -676,10 +780,10 @@ func (r *run) producing() int {
 // winner.
 func (r *run) canStartAnother() bool {
 	e := r.e
-	if r.nextIdx >= len(e.backends) {
+	if r.nextIdx >= len(r.backends) {
 		return false
 	}
-	be := e.backends[r.nextIdx]
+	be := r.backends[r.nextIdx]
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	// The primary (this run has started nothing yet) is always startable.

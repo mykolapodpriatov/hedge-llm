@@ -161,6 +161,7 @@ func TestExpositionTypesAndCounters(t *testing.T) {
 		"hedge_backend_wins_total", "hedge_backend_losses_total",
 		"hedge_redundant_requests_total", "hedge_latency_saved_seconds_total",
 		"hedge_first_token_latency_seconds", "hedge_inflight",
+		"hedge_backend_cooling",
 	} {
 		if _, ok := p.help[name]; !ok {
 			t.Errorf("missing HELP for %s", name)
@@ -367,6 +368,40 @@ func TestBuildInfoAbsentUntilSet(t *testing.T) {
 	r := NewRegistry(nil)
 	if strings.Contains(render(t, r), "hedge_build_info") {
 		t.Error("hedge_build_info should not be emitted before SetBuildInfo")
+	}
+}
+
+func TestBackendCoolingGauge(t *testing.T) {
+	r := NewRegistry(nil)
+	live := map[string]int{"alpha": 1, "beta": 0}
+	r.SetCoolingFunc(func() map[string]int { return live })
+
+	text := render(t, r)
+	p := parseExposition(t, text)
+	if p.typ["hedge_backend_cooling"] != "gauge" {
+		t.Errorf("cooling type=%q want gauge", p.typ["hedge_backend_cooling"])
+	}
+	if got := sampleValue(p, "hedge_backend_cooling", map[string]string{"backend": "alpha"}); got != "1" {
+		t.Errorf("alpha cooling=%s want 1", got)
+	}
+	if got := sampleValue(p, "hedge_backend_cooling", map[string]string{"backend": "beta"}); got != "0" {
+		t.Errorf("beta cooling=%s want 0", got)
+	}
+	// Series are sorted by backend name.
+	var order []string
+	for _, s := range p.samples {
+		if s.name == "hedge_backend_cooling" {
+			order = append(order, s.labels["backend"])
+		}
+	}
+	if len(order) != 2 || order[0] != "alpha" || order[1] != "beta" {
+		t.Errorf("cooling series order=%v want [alpha beta]", order)
+	}
+
+	live = map[string]int{"alpha": 0, "beta": 0}
+	p = parseExposition(t, render(t, r))
+	if got := sampleValue(p, "hedge_backend_cooling", map[string]string{"backend": "alpha"}); got != "0" {
+		t.Errorf("alpha cooling after expiry=%s want 0", got)
 	}
 }
 
