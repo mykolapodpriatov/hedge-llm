@@ -6,6 +6,7 @@
 // Usage:
 //
 //	hedge-llm -config config.json
+//	hedge-llm -validate -config config.json
 //
 // Configuration is a JSON file (see internal/config) with HEDGE_LLM_*
 // environment overrides for operational knobs.
@@ -46,19 +47,25 @@ func main() {
 }
 
 // run parses args against a local flag set and either services an
-// informational flag (-version / -print-config, writing to out and returning)
-// or starts the daemon. Threading args and out through the signature (instead of
-// the global flag set and os.Stdout) is what makes run testable.
+// informational flag (-version / -print-config / -validate, writing to out and
+// returning) or starts the daemon. Threading args and out through the
+// signature (instead of the global flag set and os.Stdout) is what makes run
+// testable.
 func run(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("hedge-llm", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to JSON config file (HEDGE_LLM_* env vars override scalars)")
 	showVersion := fs.Bool("version", false, "print the build version and exit")
 	printConfig := fs.Bool("print-config", false, "print the effective validated config as JSON and exit")
+	validate := fs.Bool("validate", false, "load and validate the config, then exit without starting")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
+	}
+
+	if *validate && (*showVersion || *printConfig) {
+		return fmt.Errorf("-validate cannot be combined with -version or -print-config")
 	}
 
 	if *showVersion {
@@ -69,6 +76,11 @@ func run(args []string, out io.Writer) error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+
+	if *validate {
+		_, _ = fmt.Fprintln(out, "config OK")
+		return nil
 	}
 
 	// API keys live only in the environment (never in the config), so emitting
