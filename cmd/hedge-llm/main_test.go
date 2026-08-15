@@ -67,6 +67,69 @@ func TestRunPrintConfig(t *testing.T) {
 	}
 }
 
+func TestRunValidateOK(t *testing.T) {
+	path := writeConfig(t, `{
+		"listen_addr": ":9090",
+		"backends": [
+			{"name":"openai","base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_KEY","model":"gpt-4o-mini","cost_per_request":1.0}
+		],
+		"policy": {"fire_after_ms": 120, "max_in_flight": 3, "cost_ceiling": 2.5}
+	}`)
+
+	var buf bytes.Buffer
+	if err := run([]string{"-config", path, "-validate"}, &buf); err != nil {
+		t.Fatalf("run(-validate): %v", err)
+	}
+	if got := strings.TrimSpace(buf.String()); got != "config OK" {
+		t.Errorf("output=%q want %q", got, "config OK")
+	}
+	if strings.Contains(buf.String(), "listening") {
+		t.Errorf("-validate must not start the daemon: %q", buf.String())
+	}
+}
+
+func TestRunValidateInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"missing backend", `{"listen_addr": ":8080"}`},
+		{"bad max_in_flight", `{
+			"listen_addr": ":8080",
+			"backends": [{"name":"a","base_url":"http://x/v1","model":"m","cost_per_request":1}],
+			"policy": {"fire_after_ms": 250, "max_in_flight": 0}
+		}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, tc.body)
+			var buf bytes.Buffer
+			if err := run([]string{"-config", path, "-validate"}, &buf); err == nil {
+				t.Fatal("expected validation error")
+			}
+			if strings.Contains(buf.String(), "listening") {
+				t.Errorf("output must not contain listening, got %q", buf.String())
+			}
+		})
+	}
+}
+
+func TestRunValidateExclusiveFlags(t *testing.T) {
+	path := writeConfig(t, `{
+		"listen_addr": ":8080",
+		"backends": [{"name":"a","base_url":"http://x/v1","model":"m","cost_per_request":1}],
+		"policy": {"fire_after_ms": 250, "max_in_flight": 2}
+	}`)
+	for _, extra := range []string{"-version", "-print-config"} {
+		t.Run(extra, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := run([]string{"-config", path, "-validate", extra}, &buf); err == nil {
+				t.Fatalf("expected usage error for -validate %s", extra)
+			}
+		})
+	}
+}
+
 func TestRunPrintConfigInvalidConfigErrors(t *testing.T) {
 	// A config that fails validation (no backends) must surface an error rather
 	// than printing anything.
