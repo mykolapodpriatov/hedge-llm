@@ -24,7 +24,7 @@ func TestLoadValid(t *testing.T) {
 			{"name":"openai","base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_KEY","model":"gpt-4o-mini","cost_per_request":1.0},
 			{"name":"ollama","base_url":"http://localhost:11434/v1","model":"llama3","cost_per_request":0.0}
 		],
-		"policy": {"fire_after_ms": 120, "max_in_flight": 3, "cost_ceiling": 2.5, "request_timeout_ms": 1500},
+		"policy": {"fire_after_ms": 120, "max_in_flight": 3, "cost_ceiling": 2.5, "request_timeout_ms": 1500, "loss_cooldown_n": 3, "loss_cooldown_ms": 5000},
 		"adaptive": {"enabled": true, "window": 64, "min_samples": 8}
 	}`)
 	cfg, err := Load(path)
@@ -45,6 +45,12 @@ func TestLoadValid(t *testing.T) {
 	}
 	if cfg.HedgePolicy().RequestTimeout != 1500*time.Millisecond {
 		t.Errorf("RequestTimeout=%v", cfg.HedgePolicy().RequestTimeout)
+	}
+	if cfg.Policy.LossCooldownN != 3 || cfg.Policy.LossCooldownMS != 5000 {
+		t.Errorf("loss cooldown config=%+v", cfg.Policy)
+	}
+	if cfg.HedgePolicy().LossCooldownN != 3 || cfg.HedgePolicy().LossCooldown != 5*time.Second {
+		t.Errorf("LossCooldown policy=%+v", cfg.HedgePolicy())
 	}
 	if !cfg.Adaptive.Enabled || cfg.Adaptive.Window != 64 {
 		t.Errorf("adaptive=%+v", cfg.Adaptive)
@@ -191,6 +197,8 @@ func TestValidateErrors(t *testing.T) {
 		{"neg fire_after", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, FireAfterMS: -5}}},
 		{"neg ceiling", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, CostCeiling: -1}}},
 		{"neg request_timeout", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, RequestTimeoutMS: -1}}},
+		{"neg loss_cooldown_n", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, LossCooldownN: -1}}},
+		{"neg loss_cooldown_ms", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, LossCooldownMS: -1}}},
 		{"neg adaptive window", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{Window: -1}}},
 		{"neg adaptive min_samples", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{MinSamples: -1}}},
 	}

@@ -35,6 +35,15 @@ type HedgePolicy struct {
 	// disables the ceiling (today's behavior). The bound does not abort an
 	// already-committed winner stream.
 	RequestTimeout time.Duration
+
+	// LossCooldownN is how many consecutive losses trip a backend into
+	// cooldown. 0 disables the feature (today's behavior): the backend is
+	// still offered every race.
+	LossCooldownN int
+
+	// LossCooldown is how long a tripped backend is omitted from the race.
+	// A later win or cooldown expiry resets the consecutive-loss counter.
+	LossCooldown time.Duration
 }
 
 // DefaultPolicy returns a conservative starting policy: hedge a single backup

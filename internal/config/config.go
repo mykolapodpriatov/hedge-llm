@@ -38,6 +38,11 @@ type PolicyConfig struct {
 	MaxInFlight      int     `json:"max_in_flight"`
 	CostCeiling      float64 `json:"cost_ceiling"`
 	RequestTimeoutMS int     `json:"request_timeout_ms"`
+	// LossCooldownN is consecutive losses that trip a backend into cooldown.
+	// 0 disables (the backend is still fired every request).
+	LossCooldownN int `json:"loss_cooldown_n"`
+	// LossCooldownMS is how long a tripped backend is skipped, in milliseconds.
+	LossCooldownMS int `json:"loss_cooldown_ms"`
 }
 
 // AdaptiveConfig controls adaptive latency-aware timing.
@@ -104,6 +109,8 @@ func (c Config) HedgePolicy() policy.HedgePolicy {
 		MaxInFlight:    c.Policy.MaxInFlight,
 		CostCeiling:    c.Policy.CostCeiling,
 		RequestTimeout: time.Duration(c.Policy.RequestTimeoutMS) * time.Millisecond,
+		LossCooldownN:  c.Policy.LossCooldownN,
+		LossCooldown:   time.Duration(c.Policy.LossCooldownMS) * time.Millisecond,
 	}
 }
 
@@ -230,6 +237,12 @@ func (c Config) Validate() error {
 	}
 	if c.Policy.RequestTimeoutMS < 0 {
 		return fmt.Errorf("hedge-llm: config: policy.request_timeout_ms must be >= 0")
+	}
+	if c.Policy.LossCooldownN < 0 {
+		return fmt.Errorf("hedge-llm: config: policy.loss_cooldown_n must be >= 0")
+	}
+	if c.Policy.LossCooldownMS < 0 {
+		return fmt.Errorf("hedge-llm: config: policy.loss_cooldown_ms must be >= 0")
 	}
 	if c.Adaptive.Window < 0 {
 		return fmt.Errorf("hedge-llm: config: adaptive.window must be >= 0")

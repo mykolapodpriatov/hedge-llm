@@ -111,6 +111,7 @@ type Registry struct {
 	buildInfo   map[string]string // labels for hedge_build_info, nil until set
 
 	inFlightFn func() int
+	coolingFn  func() map[string]int
 }
 
 // NewRegistry creates a metrics registry. buckets sets the first-token latency
@@ -133,6 +134,14 @@ func NewRegistry(buckets []float64) *Registry {
 func (r *Registry) SetInFlightFunc(fn func() int) {
 	if fn != nil {
 		r.inFlightFn = fn
+	}
+}
+
+// SetCoolingFunc installs the scrape-time source for hedge_backend_cooling
+// (0/1 per backend). Unset → the metric is still typed but emits no series.
+func (r *Registry) SetCoolingFunc(fn func() map[string]int) {
+	if fn != nil {
+		r.coolingFn = fn
 	}
 }
 
@@ -324,8 +333,31 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 		"Speculative backends currently in flight across all requests.",
 		float64(r.inFlightFn()))
 
+	r.writeCooling(&b)
+
 	n, err := io.WriteString(w, b.String())
 	return int64(n), err
+}
+
+func (r *Registry) writeCooling(b *strings.Builder) {
+	b.WriteString("# HELP hedge_backend_cooling Whether each backend is in loss cooldown (1) or eligible (0).\n")
+	b.WriteString("# TYPE hedge_backend_cooling gauge\n")
+	if r.coolingFn == nil {
+		return
+	}
+	m := r.coolingFn()
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		b.WriteString("hedge_backend_cooling{backend=")
+		b.WriteString(quoteLabelValue(n))
+		b.WriteString("} ")
+		b.WriteString(strconv.Itoa(m[n]))
+		b.WriteByte('\n')
+	}
 }
 
 func (r *Registry) writeHistogram(b *strings.Builder, name, help string) {

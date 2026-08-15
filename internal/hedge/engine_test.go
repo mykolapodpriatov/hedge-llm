@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -775,6 +776,147 @@ func TestRequestTimeoutCancelsStalledRace(t *testing.T) {
 		t.Errorf("inFlight=%d after timeout, want 0", got)
 	}
 	assertNoLeak(t, baseline)
+}
+
+// dialCounter wraps a backend and counts Stream() calls so tests can assert a
+// cooling backend was not dialed.
+type dialCounter struct {
+	backend.Backend
+	n atomic.Int64
+}
+
+func (d *dialCounter) Stream(ctx context.Context, req *oapi.Request) (<-chan oapi.Chunk, error) {
+	d.n.Add(1)
+	return d.Backend.Stream(ctx, req)
+}
+
+func (d *dialCounter) calls() int64 { return d.n.Load() }
+
+// After N forced losses the next race does not dial that backend; after the
+// cooldown it is eligible again; N=0 is today's always-fire behavior.
+func TestLossCooldownSkipsBackendAfterNLosses(t *testing.T) {
+	newPair := func(clk *clock.FakeClock) (*dialCounter, *dialCounter) {
+		dead := &dialCounter{Backend: &backend.FakeBackend{
+			BackendName: "dead", Clock: clk,
+			StartErr: errors.New("down"),
+		}}
+		live := &dialCounter{Backend: &backend.FakeBackend{
+			BackendName: "live", Clock: clk,
+			FirstTokenDelay: 5 * time.Millisecond,
+			Tokens:          []string{"ok"}, EmitFinish: true,
+		}}
+		return dead, live
+	}
+	runOnce := func(t *testing.T, e *Engine) Outcome {
+		t.Helper()
+		o, err := runEngine(t, e, context.Background(), &captureSink{})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if o.Winner != "live" {
+			t.Fatalf("winner=%q want live", o.Winner)
+		}
+		return o
+	}
+
+	t.Run("after N losses the next race does not dial", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		dead, live := newPair(clk)
+		// Hour-long cooldown so the clock driver cannot expire it mid-test.
+		pol := policy.HedgePolicy{
+			FireAfter:     time.Hour,
+			MaxInFlight:   2,
+			LossCooldownN: 2,
+			LossCooldown:  time.Hour,
+		}
+		e := NewEngine([]backend.Backend{dead, live}, pol, clk)
+		d := startDriver(clk, time.Millisecond)
+		defer d.Stop()
+
+		runOnce(t, e)
+		runOnce(t, e)
+		if got := dead.calls(); got != 2 {
+			t.Fatalf("dead dials after 2 losses=%d want 2", got)
+		}
+		if e.Cooling()["dead"] != 1 {
+			t.Fatalf("dead cooling=%v want 1", e.Cooling())
+		}
+		if e.Cooling()["live"] != 0 {
+			t.Fatalf("live cooling=%v want 0", e.Cooling())
+		}
+
+		runOnce(t, e)
+		if got := dead.calls(); got != 2 {
+			t.Fatalf("dead dialed while cooling: %d", got)
+		}
+
+		reg := metrics.NewRegistry(nil)
+		reg.SetCoolingFunc(e.Cooling)
+		var sb strings.Builder
+		if _, err := reg.WriteTo(&sb); err != nil {
+			t.Fatalf("WriteTo: %v", err)
+		}
+		text := sb.String()
+		if !strings.Contains(text, `hedge_backend_cooling{backend="dead"} 1`) {
+			t.Errorf("missing cooling=1 series:\n%s", text)
+		}
+		if !strings.Contains(text, `hedge_backend_cooling{backend="live"} 0`) {
+			t.Errorf("missing cooling=0 series:\n%s", text)
+		}
+	})
+
+	t.Run("after cooldown the backend is eligible again", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		dead, live := newPair(clk)
+		pol := policy.HedgePolicy{
+			FireAfter:     time.Hour,
+			MaxInFlight:   2,
+			LossCooldownN: 2,
+			LossCooldown:  time.Hour,
+		}
+		e := NewEngine([]backend.Backend{dead, live}, pol, clk)
+		d := startDriver(clk, time.Millisecond)
+		defer d.Stop()
+
+		runOnce(t, e)
+		runOnce(t, e)
+		if e.Cooling()["dead"] != 1 {
+			t.Fatalf("expected dead to be cooling")
+		}
+		clk.Advance(time.Hour)
+		if e.Cooling()["dead"] != 0 {
+			t.Fatalf("cooling after expiry=%v want 0", e.Cooling())
+		}
+		runOnce(t, e)
+		if got := dead.calls(); got != 3 {
+			t.Fatalf("dead dials after cooldown=%d want 3", got)
+		}
+	})
+
+	t.Run("N=0 is today's always-fire behavior", func(t *testing.T) {
+		clk := clock.NewFakeClock(time.Time{})
+		dead, live := newPair(clk)
+		pol := policy.HedgePolicy{
+			FireAfter:     time.Hour,
+			MaxInFlight:   2,
+			LossCooldownN: 0,
+			LossCooldown:  time.Hour,
+		}
+		e := NewEngine([]backend.Backend{dead, live}, pol, clk)
+		d := startDriver(clk, time.Millisecond)
+		defer d.Stop()
+
+		const runs = 4
+		for i := 0; i < runs; i++ {
+			runOnce(t, e)
+		}
+		if got := dead.calls(); got != runs {
+			t.Fatalf("dead dials with N=0: %d want %d", got, runs)
+		}
+		if e.Cooling()["dead"] != 0 {
+			t.Fatalf("N=0 must never report cooling: %v", e.Cooling())
+		}
+	})
 }
 
 func TestNoBackendsError(t *testing.T) {

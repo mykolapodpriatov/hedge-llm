@@ -132,6 +132,7 @@ func run(args []string, out io.Writer) error {
 	// Single source of truth for the inflight gauge: the engine's mutex-guarded
 	// counter, read at scrape time.
 	reg.SetInFlightFunc(engine.InFlight)
+	reg.SetCoolingFunc(engine.Cooling)
 
 	handler := proxy.NewHandler(engine, proxyOpts...)
 

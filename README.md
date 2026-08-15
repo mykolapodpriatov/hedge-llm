@@ -90,7 +90,7 @@ Configuration is a JSON file; a few operational knobs can be overridden by envir
       "cost_per_request": 0.0
     }
   ],
-  "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0, "request_timeout_ms": 0 },
+  "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0, "request_timeout_ms": 0, "loss_cooldown_n": 0, "loss_cooldown_ms": 0 },
   "adaptive": { "enabled": false, "window": 128, "min_samples": 10 },
   "listen_api_key_env": ""
 }
@@ -118,6 +118,8 @@ Once configured, every request to `/v1/chat/completions` must include `Authoriza
 | `max_in_flight` | Maximum number of concurrent backends per request (the primary counts as one). |
 | `cost_ceiling` | Bounds **speculative request starts** — see below. |
 | `request_timeout_ms` | Ceiling on **time-to-winner**. If no backend emits a usable token within this budget the race ends as all-failed (502) and still-running backends are cancelled. `0` disables (today's behavior). An already-committed winner stream is not aborted. |
+| `loss_cooldown_n` | Consecutive losses that trip a backend into cooldown. `0` disables (today's behavior). |
+| `loss_cooldown_ms` | How long a tripped backend is omitted from the race. A later win or cooldown expiry resets the counter. |
 
 ### The honest `cost_ceiling` semantics
 
@@ -141,6 +143,7 @@ With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer 
 | `hedge_first_token_latency_seconds` | histogram | First-token latency distribution. |
 | `hedge_latency_saved_seconds_total` | counter | Estimated cumulative first-token latency saved by hedging. |
 | `hedge_inflight` | gauge | Speculative backends currently in flight (read from the engine's authoritative counter at scrape time). |
+| `hedge_backend_cooling` | gauge | `0`/`1` per backend: `1` while that backend is in loss cooldown and will not be dialed. |
 
 A `/healthz` endpoint returns `200 ok` for liveness checks.
 
