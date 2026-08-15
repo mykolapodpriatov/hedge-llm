@@ -24,7 +24,7 @@ func TestLoadValid(t *testing.T) {
 			{"name":"openai","base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_KEY","model":"gpt-4o-mini","cost_per_request":1.0},
 			{"name":"ollama","base_url":"http://localhost:11434/v1","model":"llama3","cost_per_request":0.0}
 		],
-		"policy": {"fire_after_ms": 120, "max_in_flight": 3, "cost_ceiling": 2.5},
+		"policy": {"fire_after_ms": 120, "max_in_flight": 3, "cost_ceiling": 2.5, "request_timeout_ms": 1500},
 		"adaptive": {"enabled": true, "window": 64, "min_samples": 8}
 	}`)
 	cfg, err := Load(path)
@@ -39,6 +39,12 @@ func TestLoadValid(t *testing.T) {
 	}
 	if cfg.HedgePolicy().FireAfter != 120*time.Millisecond {
 		t.Errorf("FireAfter=%v", cfg.HedgePolicy().FireAfter)
+	}
+	if cfg.Policy.RequestTimeoutMS != 1500 {
+		t.Errorf("RequestTimeoutMS=%d", cfg.Policy.RequestTimeoutMS)
+	}
+	if cfg.HedgePolicy().RequestTimeout != 1500*time.Millisecond {
+		t.Errorf("RequestTimeout=%v", cfg.HedgePolicy().RequestTimeout)
 	}
 	if !cfg.Adaptive.Enabled || cfg.Adaptive.Window != 64 {
 		t.Errorf("adaptive=%+v", cfg.Adaptive)
@@ -55,6 +61,7 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("HEDGE_LLM_FIRE_AFTER_MS", "75")
 	t.Setenv("HEDGE_LLM_MAX_IN_FLIGHT", "4")
 	t.Setenv("HEDGE_LLM_COST_CEILING", "9.5")
+	t.Setenv("HEDGE_LLM_REQUEST_TIMEOUT_MS", "800")
 	t.Setenv("HEDGE_LLM_ADAPTIVE", "true")
 
 	cfg, err := Load(path)
@@ -72,6 +79,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.Policy.CostCeiling != 9.5 {
 		t.Errorf("env CostCeiling override failed: %v", cfg.Policy.CostCeiling)
+	}
+	if cfg.Policy.RequestTimeoutMS != 800 {
+		t.Errorf("env RequestTimeoutMS override failed: %d", cfg.Policy.RequestTimeoutMS)
 	}
 	if !cfg.Adaptive.Enabled {
 		t.Error("env adaptive override failed")
@@ -151,6 +161,8 @@ func TestLoadMalformedEnvOverrides(t *testing.T) {
 		{"float fire_after_ms", "HEDGE_LLM_FIRE_AFTER_MS", "12.5"},
 		{"non-integer max_in_flight", "HEDGE_LLM_MAX_IN_FLIGHT", "two"},
 		{"non-number cost_ceiling", "HEDGE_LLM_COST_CEILING", "notanumber"},
+		{"non-integer request_timeout_ms", "HEDGE_LLM_REQUEST_TIMEOUT_MS", "abc"},
+		{"float request_timeout_ms", "HEDGE_LLM_REQUEST_TIMEOUT_MS", "12.5"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -178,6 +190,7 @@ func TestValidateErrors(t *testing.T) {
 		{"bad max_in_flight", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 0}}},
 		{"neg fire_after", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, FireAfterMS: -5}}},
 		{"neg ceiling", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, CostCeiling: -1}}},
+		{"neg request_timeout", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1, RequestTimeoutMS: -1}}},
 		{"neg adaptive window", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{Window: -1}}},
 		{"neg adaptive min_samples", Config{ListenAddr: ":1", Backends: []BackendConfig{{Name: "a", BaseURL: "u", Model: "m"}}, Policy: PolicyConfig{MaxInFlight: 1}, Adaptive: AdaptiveConfig{MinSamples: -1}}},
 	}

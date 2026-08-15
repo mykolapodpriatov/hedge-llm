@@ -90,7 +90,7 @@ Configuration is a JSON file; a few operational knobs can be overridden by envir
       "cost_per_request": 0.0
     }
   ],
-  "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0 },
+  "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0, "request_timeout_ms": 0 },
   "adaptive": { "enabled": false, "window": 128, "min_samples": 10 },
   "listen_api_key_env": ""
 }
@@ -99,7 +99,7 @@ Configuration is a JSON file; a few operational knobs can be overridden by envir
 - Backends are tried in order; the **first is the primary**. API keys are read from the named environment variable and never stored in the file (omit `api_key_env` for keyless upstreams like a local Ollama).
 - `v1` targets **OpenAI-compatible** streaming upstreams (OpenAI, Azure OpenAI, vLLM, Ollama's `/v1`, …). Anthropic/Gemini normalization is a documented extension point.
 
-Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDGE_LLM_MAX_IN_FLIGHT`, `HEDGE_LLM_COST_CEILING`, `HEDGE_LLM_ADAPTIVE`, `HEDGE_LLM_API_KEY`.
+Environment overrides: `HEDGE_LLM_LISTEN_ADDR`, `HEDGE_LLM_FIRE_AFTER_MS`, `HEDGE_LLM_MAX_IN_FLIGHT`, `HEDGE_LLM_COST_CEILING`, `HEDGE_LLM_REQUEST_TIMEOUT_MS`, `HEDGE_LLM_ADAPTIVE`, `HEDGE_LLM_API_KEY`.
 
 ### Inbound authentication
 
@@ -117,6 +117,7 @@ Once configured, every request to `/v1/chat/completions` must include `Authoriza
 | `fire_after_ms` | How long to wait, after the last backend start, before starting the next backup if no usable token has arrived. |
 | `max_in_flight` | Maximum number of concurrent backends per request (the primary counts as one). |
 | `cost_ceiling` | Bounds **speculative request starts** — see below. |
+| `request_timeout_ms` | Ceiling on **time-to-winner**. If no backend emits a usable token within this budget the race ends as all-failed (502) and still-running backends are cancelled. `0` disables (today's behavior). An already-committed winner stream is not aborted. |
 
 ### The honest `cost_ceiling` semantics
 

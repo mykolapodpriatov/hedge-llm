@@ -719,6 +719,64 @@ func TestLoserContentNeverRelayed(t *testing.T) {
 	}
 }
 
+// A request-timeout ceiling that elapses mid-race with no usable token ends
+// the same way as all-lose: ErrAllBackendsFailed, sink never committed, every
+// still-running backend recorded as canceled, and no leftover goroutines or
+// in-flight reservations. Timing is entirely FakeClock-driven.
+func TestRequestTimeoutCancelsStalledRace(t *testing.T) {
+	baseline := waitGoroutines(t, 0)
+
+	clk := clock.NewFakeClock(time.Time{})
+	// Both backends accept the request and then never emit another byte — the
+	// stall class fire_after cannot bound.
+	primary := &backend.FakeBackend{
+		BackendName: "primary", Clock: clk,
+		FirstTokenDelay: time.Hour,
+		Tokens:          []string{"P"},
+	}
+	backup := &backend.FakeBackend{
+		BackendName: "backup", Clock: clk,
+		FirstTokenDelay: time.Hour,
+		Tokens:          []string{"B"},
+	}
+	pol := policy.HedgePolicy{
+		FireAfter:      10 * time.Millisecond,
+		MaxInFlight:    2,
+		RequestTimeout: 50 * time.Millisecond,
+	}
+	e := NewEngine([]backend.Backend{primary, backup}, pol, clk)
+
+	d := startDriver(clk, 2*time.Millisecond)
+	defer d.Stop()
+
+	sink := &captureSink{}
+	o, err := runEngine(t, e, context.Background(), sink)
+	if !errors.Is(err, ErrAllBackendsFailed) {
+		t.Fatalf("err=%v want ErrAllBackendsFailed", err)
+	}
+	if o.Winner != "" {
+		t.Errorf("winner=%q want empty", o.Winner)
+	}
+	if committed, _, _ := sink.snapshot(); committed {
+		t.Error("sink must NOT be committed when the request timeout fires")
+	}
+	if o.Started != 2 {
+		t.Errorf("started=%d want 2 (timeout must not prevent the backup from firing)", o.Started)
+	}
+	if len(o.Losses) != 2 {
+		t.Fatalf("losses=%d want 2, got %+v", len(o.Losses), o.Losses)
+	}
+	for _, l := range o.Losses {
+		if l.Reason != LossReasonCanceled {
+			t.Errorf("loss %+v want reason %q", l, LossReasonCanceled)
+		}
+	}
+	if got := e.InFlight(); got != 0 {
+		t.Errorf("inFlight=%d after timeout, want 0", got)
+	}
+	assertNoLeak(t, baseline)
+}
+
 func TestNoBackendsError(t *testing.T) {
 	e := NewEngine(nil, policy.DefaultPolicy(), clock.NewFakeClock(time.Time{}))
 	_, err := e.Run(context.Background(), testReq(), &captureSink{})
