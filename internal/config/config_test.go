@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -253,5 +254,154 @@ func TestDefaultConfigHasNoBackends(t *testing.T) {
 	}
 	if err := d.Validate(); err == nil {
 		t.Error("default config should fail validation (no backends)")
+	}
+}
+
+// ---- per-model policy overrides --------------------------------------------
+
+// baseConfigWithOverrides returns a minimal valid config carrying the given
+// overrides, so each test below only has to state what it is checking.
+func baseConfigWithOverrides(ovs map[string]PolicyOverride) Config {
+	c := Default()
+	c.Backends = []BackendConfig{{Name: "a", BaseURL: "http://x/v1", Model: "m"}}
+	c.Policy = PolicyConfig{FireAfterMS: 250, MaxInFlight: 2, CostCeiling: 0, RequestTimeoutMS: 0}
+	c.PolicyOverrides = ovs
+	return c
+}
+
+func intPtr(v int) *int           { return &v }
+func floatPtr(v float64) *float64 { return &v }
+
+// A partial override changes only the fields it names.
+func TestHedgePolicyForMergesPartialOverride(t *testing.T) {
+	c := baseConfigWithOverrides(map[string]PolicyOverride{
+		"fast": {FireAfterMS: intPtr(120)},
+	})
+	got := c.HedgePolicyFor("fast")
+	if got.FireAfter != 120*time.Millisecond {
+		t.Errorf("FireAfter=%v, want 120ms", got.FireAfter)
+	}
+	if got.MaxInFlight != 2 {
+		t.Errorf("MaxInFlight=%d, want the default 2", got.MaxInFlight)
+	}
+}
+
+// Every overridable knob round-trips.
+func TestHedgePolicyForOverridesEveryKnob(t *testing.T) {
+	c := baseConfigWithOverrides(map[string]PolicyOverride{
+		"tuned": {
+			FireAfterMS:      intPtr(2000),
+			MaxInFlight:      intPtr(1),
+			CostCeiling:      floatPtr(2.5),
+			RequestTimeoutMS: intPtr(30000),
+		},
+	})
+	got := c.HedgePolicyFor("tuned")
+	if got.FireAfter != 2*time.Second {
+		t.Errorf("FireAfter=%v, want 2s", got.FireAfter)
+	}
+	if got.MaxInFlight != 1 {
+		t.Errorf("MaxInFlight=%d, want 1", got.MaxInFlight)
+	}
+	if got.CostCeiling != 2.5 {
+		t.Errorf("CostCeiling=%v, want 2.5", got.CostCeiling)
+	}
+	if got.RequestTimeout != 30*time.Second {
+		t.Errorf("RequestTimeout=%v, want 30s", got.RequestTimeout)
+	}
+}
+
+// An explicit zero is a real value, not "inherit the default".
+func TestHedgePolicyForExplicitZeroDisablesGate(t *testing.T) {
+	c := baseConfigWithOverrides(map[string]PolicyOverride{
+		"open": {CostCeiling: floatPtr(0)},
+	})
+	c.Policy.CostCeiling = 5
+	if got := c.HedgePolicyFor("open").CostCeiling; got != 0 {
+		t.Errorf("CostCeiling=%v, want 0 (explicitly disabled)", got)
+	}
+	if got := c.HedgePolicyFor("other").CostCeiling; got != 5 {
+		t.Errorf("unlisted model CostCeiling=%v, want the default 5", got)
+	}
+}
+
+// An unlisted model, and a config with no overrides at all, use the default.
+func TestHedgePolicyForFallsBackToDefault(t *testing.T) {
+	withOverrides := baseConfigWithOverrides(map[string]PolicyOverride{
+		"fast": {FireAfterMS: intPtr(120)},
+	})
+	none := baseConfigWithOverrides(nil)
+	want := none.HedgePolicy()
+	if got := withOverrides.HedgePolicyFor("unknown"); got != want {
+		t.Errorf("unknown model: %+v, want the default %+v", got, want)
+	}
+	if got := none.HedgePolicyFor("anything"); got != want {
+		t.Errorf("no overrides configured: %+v, want %+v", got, want)
+	}
+	if none.HasPolicyOverrides() {
+		t.Error("HasPolicyOverrides() = true with no overrides configured")
+	}
+	if !withOverrides.HasPolicyOverrides() {
+		t.Error("HasPolicyOverrides() = false with one override configured")
+	}
+}
+
+// The merged override is held to the same bounds as the default policy.
+func TestValidateRejectsBadOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ovs  map[string]PolicyOverride
+		want string
+	}{
+		{"max_in_flight below one", map[string]PolicyOverride{"m": {MaxInFlight: intPtr(0)}}, `policy_overrides["m"].max_in_flight`},
+		{"negative fire_after", map[string]PolicyOverride{"m": {FireAfterMS: intPtr(-1)}}, `policy_overrides["m"].fire_after_ms`},
+		{"negative cost_ceiling", map[string]PolicyOverride{"m": {CostCeiling: floatPtr(-0.5)}}, `policy_overrides["m"].cost_ceiling`},
+		{"negative request_timeout", map[string]PolicyOverride{"m": {RequestTimeoutMS: intPtr(-5)}}, `policy_overrides["m"].request_timeout_ms`},
+		{"empty model key", map[string]PolicyOverride{"": {FireAfterMS: intPtr(10)}}, "empty model key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := baseConfigWithOverrides(tc.ovs).Validate()
+			if err == nil {
+				t.Fatalf("Validate() = nil, want an error mentioning %s", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Validate() = %v, want it to mention %s", err, tc.want)
+			}
+		})
+	}
+}
+
+// A valid override passes validation.
+func TestValidateAcceptsGoodOverride(t *testing.T) {
+	c := baseConfigWithOverrides(map[string]PolicyOverride{
+		"o3":          {FireAfterMS: intPtr(2000), MaxInFlight: intPtr(1), CostCeiling: floatPtr(2)},
+		"gpt-4o-mini": {FireAfterMS: intPtr(120), MaxInFlight: intPtr(3)},
+	})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// The key survives a JSON round-trip, which is what -print-config emits.
+func TestPolicyOverridesLoadFromJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{
+	  "backends": [{"name": "a", "base_url": "http://x/v1", "model": "m"}],
+	  "policy": {"fire_after_ms": 250, "max_in_flight": 2},
+	  "policy_overrides": {"o3": {"fire_after_ms": 2000, "max_in_flight": 1}}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() = %v", err)
+	}
+	if got := cfg.HedgePolicyFor("o3"); got.FireAfter != 2*time.Second || got.MaxInFlight != 1 {
+		t.Errorf("o3 policy = %+v, want fire_after 2s / max_in_flight 1", got)
+	}
+	if got := cfg.HedgePolicyFor("other").FireAfter; got != 250*time.Millisecond {
+		t.Errorf("unlisted model fire_after = %v, want 250ms", got)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,22 @@ type PolicyConfig struct {
 	LossCooldownMS int `json:"loss_cooldown_ms"`
 }
 
+// PolicyOverride is a partial hedge policy applied on top of the default
+// policy for one requested model. Every field is a pointer so that "absent"
+// and "set to zero" stay distinguishable: a nil field inherits the default,
+// while an explicit 0 turns the corresponding gate off.
+//
+// Only the four per-request knobs are overridable. loss_cooldown_n and
+// loss_cooldown_ms stay engine-wide because the consecutive-loss book is
+// shared across every model a backend serves, so a per-model cooldown would
+// have ambiguous semantics.
+type PolicyOverride struct {
+	FireAfterMS      *int     `json:"fire_after_ms,omitempty"`
+	MaxInFlight      *int     `json:"max_in_flight,omitempty"`
+	CostCeiling      *float64 `json:"cost_ceiling,omitempty"`
+	RequestTimeoutMS *int     `json:"request_timeout_ms,omitempty"`
+}
+
 // AdaptiveConfig controls adaptive latency-aware timing.
 type AdaptiveConfig struct {
 	// Enabled turns on adaptive fire-after (off by default → static FireAfter).
@@ -64,6 +81,11 @@ type Config struct {
 	Backends []BackendConfig `json:"backends"`
 	// Policy is the default hedge policy.
 	Policy PolicyConfig `json:"policy"`
+	// PolicyOverrides maps a requested model name to a partial policy merged
+	// over Policy for requests naming that model. A model with no entry uses
+	// Policy unchanged, so an existing config without this key behaves
+	// exactly as before.
+	PolicyOverrides map[string]PolicyOverride `json:"policy_overrides,omitempty"`
 	// Adaptive configures adaptive timing.
 	Adaptive AdaptiveConfig `json:"adaptive"`
 	// ListenAPIKeyEnv optionally names an environment variable holding the
@@ -112,6 +134,41 @@ func (c Config) HedgePolicy() policy.HedgePolicy {
 		LossCooldownN:  c.Policy.LossCooldownN,
 		LossCooldown:   time.Duration(c.Policy.LossCooldownMS) * time.Millisecond,
 	}
+}
+
+// HedgePolicyFor returns the runtime policy for a requested model: the default
+// policy with that model's override merged over it. An unknown or empty model
+// yields the default policy unchanged.
+func (c Config) HedgePolicyFor(model string) policy.HedgePolicy {
+	base := c.HedgePolicy()
+	ov, ok := c.PolicyOverrides[model]
+	if !ok {
+		return base
+	}
+	return ov.apply(base)
+}
+
+// HasPolicyOverrides reports whether any per-model override is configured.
+// main uses it to decide whether the engine needs a per-request policy func at
+// all, keeping the single-policy path allocation-free.
+func (c Config) HasPolicyOverrides() bool { return len(c.PolicyOverrides) > 0 }
+
+// apply merges the override over base, leaving fields the override does not
+// name untouched.
+func (o PolicyOverride) apply(base policy.HedgePolicy) policy.HedgePolicy {
+	if o.FireAfterMS != nil {
+		base.FireAfter = time.Duration(*o.FireAfterMS) * time.Millisecond
+	}
+	if o.MaxInFlight != nil {
+		base.MaxInFlight = *o.MaxInFlight
+	}
+	if o.CostCeiling != nil {
+		base.CostCeiling = *o.CostCeiling
+	}
+	if o.RequestTimeoutMS != nil {
+		base.RequestTimeout = time.Duration(*o.RequestTimeoutMS) * time.Millisecond
+	}
+	return base
 }
 
 // Load reads, env-overrides, and validates configuration from the given file
@@ -244,6 +301,28 @@ func (c Config) Validate() error {
 	if c.Policy.LossCooldownMS < 0 {
 		return fmt.Errorf("hedge-llm: config: policy.loss_cooldown_ms must be >= 0")
 	}
+	// Per-model overrides are validated on the MERGED result, so an override
+	// is held to exactly the same bounds as the default policy and an operator
+	// cannot smuggle max_in_flight=0 past the check by only naming that field.
+	// Sorting the keys keeps the reported error stable for a given config.
+	for _, model := range sortedKeys(c.PolicyOverrides) {
+		merged := c.PolicyOverrides[model].apply(c.HedgePolicy())
+		if strings.TrimSpace(model) == "" {
+			return fmt.Errorf("hedge-llm: config: policy_overrides has an empty model key")
+		}
+		if merged.FireAfter < 0 {
+			return fmt.Errorf("hedge-llm: config: policy_overrides[%q].fire_after_ms must be >= 0", model)
+		}
+		if merged.MaxInFlight < 1 {
+			return fmt.Errorf("hedge-llm: config: policy_overrides[%q].max_in_flight must be >= 1", model)
+		}
+		if merged.CostCeiling < 0 {
+			return fmt.Errorf("hedge-llm: config: policy_overrides[%q].cost_ceiling must be >= 0", model)
+		}
+		if merged.RequestTimeout < 0 {
+			return fmt.Errorf("hedge-llm: config: policy_overrides[%q].request_timeout_ms must be >= 0", model)
+		}
+	}
 	if c.Adaptive.Window < 0 {
 		return fmt.Errorf("hedge-llm: config: adaptive.window must be >= 0")
 	}
@@ -251,6 +330,16 @@ func (c Config) Validate() error {
 		return fmt.Errorf("hedge-llm: config: adaptive.min_samples must be >= 0")
 	}
 	return nil
+}
+
+// sortedKeys returns the map's keys in lexical order.
+func sortedKeys(m map[string]PolicyOverride) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // BuildBackends constructs the runtime backend set from the config, resolving

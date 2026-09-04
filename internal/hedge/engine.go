@@ -156,6 +156,13 @@ type Engine struct {
 	pol      policy.HedgePolicy
 	clk      clock.Clock
 
+	// policyFn, when non-nil, is consulted ONCE per Run to derive that run's
+	// policy from the requested model (e.g. config.HedgePolicyFor). It falls
+	// back to pol when nil. Every gate inside a run reads the resolved
+	// per-run policy, so two concurrent requests for different models can hold
+	// different fire-after delays, in-flight caps and cost ceilings.
+	policyFn func(model string) policy.HedgePolicy
+
 	// fireAfterFn, when non-nil, is consulted ONCE per Run to derive that run's
 	// fire-after delay from the primary backend's name (e.g. the adaptive
 	// estimator's SuggestFireAfter). It falls back to the static
@@ -189,6 +196,15 @@ func WithFireAfterFunc(fn func(primary string) time.Duration) Option {
 	return func(e *Engine) { e.fireAfterFn = fn }
 }
 
+// WithPolicyFunc installs a function consulted ONCE per Run to derive that
+// run's hedge policy from the model named in the request. This is how
+// per-model policy overrides are wired in: pass config.HedgePolicyFor. When no
+// function is installed the engine uses the single policy passed to NewEngine
+// for every request, which is the default.
+func WithPolicyFunc(fn func(model string) policy.HedgePolicy) Option {
+	return func(e *Engine) { e.policyFn = fn }
+}
+
 // NewEngine constructs an Engine. clk defaults to clock.RealClock if nil.
 func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clock, opts ...Option) *Engine {
 	if clk == nil {
@@ -206,18 +222,29 @@ func NewEngine(backends []backend.Backend, pol policy.HedgePolicy, clk clock.Clo
 	return e
 }
 
+// resolvePolicy consults the optional per-run policy function once, falling
+// back to the engine's single configured policy when none is installed.
+func (e *Engine) resolvePolicy(model string) policy.HedgePolicy {
+	if e.policyFn == nil {
+		return e.pol
+	}
+	return e.policyFn(model)
+}
+
 // resolveFireAfter consults the optional per-run fire-after function once,
-// falling back to the static policy FireAfter when no function is installed or
-// it returns a non-positive duration. primary is the name of this run's first
+// falling back to pol.FireAfter when no function is installed or it returns a
+// non-positive duration. pol is this run's already-resolved policy, so an
+// adaptive suggestion and a per-model override compose: the override sets the
+// floor the estimator falls back to. primary is the name of this run's first
 // eligible backend; callers must only invoke this when at least one remains.
-func (e *Engine) resolveFireAfter(primary string) time.Duration {
+func (e *Engine) resolveFireAfter(primary string, pol policy.HedgePolicy) time.Duration {
 	if e.fireAfterFn == nil {
-		return e.pol.FireAfter
+		return pol.FireAfter
 	}
 	if d := e.fireAfterFn(primary); d > 0 {
 		return d
 	}
-	return e.pol.FireAfter
+	return pol.FireAfter
 }
 
 // InFlight returns the current number of in-flight backends across the engine,
@@ -332,7 +359,8 @@ type run struct {
 	runCtx    context.Context
 	req       *oapi.Request
 	start     time.Time
-	fireAfter time.Duration // this run's resolved fire-after delay (adaptive or static)
+	pol       policy.HedgePolicy // this run's resolved policy (per-model override or engine default)
+	fireAfter time.Duration      // this run's resolved fire-after delay (adaptive or static)
 	wg        *sync.WaitGroup
 	events    chan event
 	states    []*backendState
@@ -363,6 +391,12 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		return Outcome{}, ErrNoBackends
 	}
 
+	// Resolve this request's policy ONCE, from the model it named, and hand it
+	// to the run. Every gate below reads r.pol, never e.pol, so a slow
+	// expensive model and a cheap fast one can be served concurrently by one
+	// process under different hedging rules.
+	pol := e.resolvePolicy(req.Model)
+
 	runCtx, cancelAll := context.WithCancel(clientCtx)
 	var wg sync.WaitGroup
 	r := &run{
@@ -371,7 +405,8 @@ func (e *Engine) Run(clientCtx context.Context, req *oapi.Request, sink Sink) (O
 		runCtx:    runCtx,
 		req:       req,
 		start:     e.clk.Now(),
-		fireAfter: e.resolveFireAfter(backends[0].Name()),
+		pol:       pol,
+		fireAfter: e.resolveFireAfter(backends[0].Name(), pol),
 		winnerIdx: -1,
 		wg:        &wg,
 		// Buffer sized len(backends)*2 so each backend can have BOTH an in-flight
@@ -485,7 +520,7 @@ func (r *run) startNext() bool {
 	e.mu.Lock()
 	// The first backend of THIS run is the primary and always starts. For
 	// backups, enforce both bounds atomically under the single lock.
-	if len(r.states) > 0 && !e.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest()) {
+	if len(r.states) > 0 && !r.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest()) {
 		e.mu.Unlock()
 		return false
 	}
@@ -593,8 +628,8 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// with no real sleeps, and so an already-committed winner stream is not
 	// aborted (the timer is only selected in this pre-winner loop). 0 disables.
 	var timeoutC <-chan time.Time
-	if e.pol.RequestTimeout > 0 {
-		timeoutTimer := e.clk.NewTimer(e.pol.RequestTimeout)
+	if r.pol.RequestTimeout > 0 {
+		timeoutTimer := e.clk.NewTimer(r.pol.RequestTimeout)
 		defer timeoutTimer.Stop()
 		timeoutC = timeoutTimer.C()
 	}
@@ -613,7 +648,7 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// check-and-increment inside startNext, so a stale hint can only cost a
 	// harmless extra timer fire that startNext then declines.
 	armFire := func() {
-		if e.pol.HasHeadroom(e.InFlight()) && r.hasMore() {
+		if r.pol.HasHeadroom(e.InFlight()) && r.hasMore() {
 			fireTimer.Reset(r.fireAfter)
 			armed = true
 		} else {
@@ -790,7 +825,7 @@ func (r *run) canStartAnother() bool {
 	if len(r.states) == 0 {
 		return true
 	}
-	return e.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest())
+	return r.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest())
 }
 
 // noPathToWinner reports whether the race can no longer reach a usable token: no
@@ -811,7 +846,7 @@ func (r *run) noPathToWinner() bool {
 // shouldStartAfterLoss reports whether the policy still permits starting another
 // backend (headroom remains and one is left).
 func (r *run) shouldStartAfterLoss() bool {
-	return r.e.pol.HasHeadroom(r.e.InFlight()) && r.hasMore()
+	return r.pol.HasHeadroom(r.e.InFlight()) && r.hasMore()
 }
 
 // releaseN decrements the engine-wide in-flight reservation by n and the

@@ -23,6 +23,10 @@
     "loss_cooldown_n": 0,
     "loss_cooldown_ms": 0
   },
+  "policy_overrides": {
+    "gpt-4o-mini": { "fire_after_ms": 120, "max_in_flight": 3 },
+    "o3": { "fire_after_ms": 2000, "max_in_flight": 1, "cost_ceiling": 2.0 }
+  },
   "adaptive": {
     "enabled": false,
     "window": 128,
