@@ -68,6 +68,24 @@ curl http://localhost:8080/v1/chat/completions \
 
 Any extra fields in the request (`temperature`, `tools`, `response_format`, …) pass through to the upstreams unchanged.
 
+### Run it in a container
+
+The daemon belongs next to whatever service is calling the LLM, so it ships a multi-stage `Dockerfile`. The build is `CGO_ENABLED=0` and `-trimpath`, and the result lands in `gcr.io/distroless/static-debian12:nonroot`: no shell, no package manager, uid 65532.
+
+```bash
+docker build --build-arg VERSION="$(git describe --tags --always --dirty)" -t hedge-llm .
+docker run --rm -p 8080:8080 \
+  -v "$PWD/config.example.json:/etc/hedge-llm/config.json:ro" \
+  -e OPENAI_API_KEY \
+  hedge-llm -config /etc/hedge-llm/config.json
+```
+
+`VERSION` is stamped into the binary, so `docker run --rm hedge-llm -version` tells you which build is running. Omit it and you get `dev`, the same as a plain `go build`.
+
+The config is mounted read-only and API keys stay in the environment, named by `api_key_env`, so no secret is ever written into a layer. [`docker-compose.yml`](docker-compose.yml) is the same thing with the mount and the key passthrough already wired. Note that `config.example.json` also lists an Ollama backend on `localhost:11434`, and inside a container `localhost` is the container: point that `base_url` at `host.docker.internal` or at a service name on the same network.
+
+CI builds the image on every push, then asserts that `-version` reports the stamped value and that the image does not run as root.
+
 ### Configuration
 
 Configuration is a JSON file; a few operational knobs can be overridden by environment variables.

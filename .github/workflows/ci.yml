@@ -66,3 +66,33 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --build-arg VERSION=ci-${{ github.sha }} -t hedge-llm:ci .
+
+      # The point of the version stamp is that a running container can say
+      # which build it is. Assert it, so a broken -ldflags line fails CI
+      # instead of shipping an image that reports "dev".
+      - name: Assert the version stamp reached the binary
+        run: |
+          got="$(docker run --rm hedge-llm:ci -version)"
+          want="ci-${{ github.sha }}"
+          if [ "$got" != "$want" ]; then
+            echo "-version printed '$got', want '$want'"
+            exit 1
+          fi
+
+      - name: Assert the image does not run as root
+        run: |
+          uid="$(docker image inspect hedge-llm:ci --format '{{.Config.User}}')"
+          if [ -z "$uid" ] || [ "$uid" = "root" ] || [ "$uid" = "0" ]; then
+            echo "image runs as '$uid', want a non-root user"
+            exit 1
+          fi

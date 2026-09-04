@@ -1,0 +1,31 @@
+# Minimal example: run the daemon in a container against a hosted backend.
+#
+#   OPENAI_API_KEY=sk-... docker compose up --build
+#
+# Keys are passed through the environment and named by api_key_env in the
+# config, so nothing secret is ever written into an image layer or into this
+# file.
+#
+# config.example.json also lists an Ollama backend at localhost:11434. Inside
+# the container "localhost" is the container, not your machine. Either point
+# that base_url at host.docker.internal (Docker Desktop), add an ollama service
+# to this file and use its service name, or drop the backend from your copy of
+# the config.
+services:
+  hedge-llm:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    ports:
+      - "8080:8080"
+    volumes:
+      # Read-only: the daemon never writes its config, and a compromised
+      # process should not be able to rewrite the backend list.
+      - ./config.example.json:/etc/hedge-llm/config.json:ro
+    command: ["-config", "/etc/hedge-llm/config.json"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in your shell or a .env file}
+      # Uncomment to require an inbound key from clients:
+      # HEDGE_LLM_API_KEY: ${HEDGE_LLM_API_KEY}
+    restart: unless-stopped
