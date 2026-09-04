@@ -91,6 +91,10 @@ Configuration is a JSON file; a few operational knobs can be overridden by envir
     }
   ],
   "policy": { "fire_after_ms": 250, "max_in_flight": 2, "cost_ceiling": 0, "request_timeout_ms": 0, "loss_cooldown_n": 0, "loss_cooldown_ms": 0 },
+  "policy_overrides": {
+    "gpt-4o-mini": { "fire_after_ms": 120, "max_in_flight": 3 },
+    "o3": { "fire_after_ms": 2000, "max_in_flight": 1, "cost_ceiling": 2.0 }
+  },
   "adaptive": { "enabled": false, "window": 128, "min_samples": 10 },
   "listen_api_key_env": ""
 }
@@ -120,6 +124,23 @@ Once configured, every request to `/v1/chat/completions` must include `Authoriza
 | `request_timeout_ms` | Ceiling on **time-to-winner**. If no backend emits a usable token within this budget the race ends as all-failed (502) and still-running backends are cancelled. `0` disables (today's behavior). An already-committed winner stream is not aborted. |
 | `loss_cooldown_n` | Consecutive losses that trip a backend into cooldown. `0` disables (today's behavior). |
 | `loss_cooldown_ms` | How long a tripped backend is omitted from the race. A later win or cooldown expiry resets the counter. |
+
+### Per-model policy overrides
+
+One process, one policy is the wrong shape for a mixed deployment. A cheap fast model wants an aggressive hedge; an expensive reasoning model wants a conservative one and a cost ceiling. `policy_overrides` keys a partial policy by the model name the **client** sends, and merges it over `policy` for that request:
+
+```json
+"policy_overrides": {
+  "gpt-4o-mini": { "fire_after_ms": 120, "max_in_flight": 3 },
+  "o3": { "fire_after_ms": 2000, "max_in_flight": 1, "cost_ceiling": 2.0 }
+}
+```
+
+A field the override omits keeps its value from `policy`, so a one-line override changes one knob and nothing else. An explicit `0` is a real value, not "inherit": `"cost_ceiling": 0` turns the gate off for that model even when the default sets one. A model with no entry uses `policy` unchanged, so a config without the key behaves exactly as before.
+
+`fire_after_ms`, `max_in_flight`, `cost_ceiling` and `request_timeout_ms` are overridable. `loss_cooldown_n` and `loss_cooldown_ms` stay engine-wide, because the consecutive-loss book belongs to the backend rather than to one model, and a backend usually serves several. Overrides are validated on the merged result, so `max_in_flight: 0` is rejected at startup rather than silently clamped, and `-print-config` shows what the daemon resolved.
+
+Adaptive timing composes with an override: the per-model `fire_after_ms` is the value the estimator falls back to until that primary has collected `min_samples`.
 
 ### The honest `cost_ceiling` semantics
 
@@ -179,7 +200,8 @@ Implemented and tested:
 
 Designed for future work:
 
-- [ ] Per-route cost budgets; shadow/canary mode
+- [x] Per-model policy overrides (`policy_overrides`)
+- [ ] Shadow/canary mode
 - [ ] Anthropic/Gemini normalization adapters
 - [ ] Kubernetes sidecar chart
 

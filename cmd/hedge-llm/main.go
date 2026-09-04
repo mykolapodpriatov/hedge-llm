@@ -128,6 +128,14 @@ func run(args []string, out io.Writer) error {
 		log.Printf("hedge-llm: adaptive timing enabled (window=%d, min_samples=%d)", cfg.Adaptive.Window, cfg.Adaptive.MinSamples)
 	}
 
+	// Per-model overrides: hand the engine a resolver instead of a single
+	// policy so each request is hedged under the rules for the model it named.
+	// Without any override configured the engine keeps the single-policy path.
+	if cfg.HasPolicyOverrides() {
+		engineOpts = append(engineOpts, hedge.WithPolicyFunc(cfg.HedgePolicyFor))
+		log.Printf("hedge-llm: per-model policy overrides active for %d model(s)", len(cfg.PolicyOverrides))
+	}
+
 	engine := hedge.NewEngine(backends, cfg.HedgePolicy(), clock.RealClock{}, engineOpts...)
 	// Single source of truth for the inflight gauge: the engine's mutex-guarded
 	// counter, read at scrape time.
