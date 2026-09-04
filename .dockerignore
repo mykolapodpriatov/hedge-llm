@@ -1,0 +1,16 @@
+# Keep the build context to what the compiler actually needs. Everything else
+# only invalidates the layer cache and slows the context upload.
+.git
+.github
+.gitignore
+.wt
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env
+.env.*
+coverage.txt
+coverage.html
+dist/
+bin/
