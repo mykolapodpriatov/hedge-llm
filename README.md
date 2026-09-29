@@ -175,7 +175,8 @@ With `adaptive.enabled: true`, the daemon keeps a bounded in-memory ring buffer 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `hedge_requests_total` | counter | Chat-completion requests handled. |
-| `hedge_requests_failed_total` | counter | Requests that produced no winner (every backend failed → the client got a 502). |
+| `hedge_requests_failed_total` | counter | Requests that produced no winner because the backends failed, produced no usable token, or the request timeout ceiling fired → the client got a 502. Does NOT include client disconnects, see below. |
+| `hedge_requests_canceled_total` | counter | Requests that produced no winner because the client's own context was cancelled (disconnected, gave up) before any backend won → the client got a 499. Kept separate from `hedge_requests_failed_total` so a burst of abandoned clients does not read as an upstream outage. |
 | `hedge_backend_wins_total{backend}` | counter | Requests won, per backend. |
 | `hedge_backend_losses_total{backend,reason}` | counter | Requests lost, per backend, by `reason` (`error`, `no_usable_token`, `canceled`) — so per-backend loss/error rate is computable. Cardinality is bounded to backends × 3. |
 | `hedge_redundant_requests_total` | counter | Speculative backups started beyond the primary. |

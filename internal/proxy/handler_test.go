@@ -192,6 +192,38 @@ func TestAllBackendsFailReturnsErrorJSON(t *testing.T) {
 	}
 }
 
+// TestAllBackendsFailIncrementsFailedRequests checks that a genuine
+// all-backends failure (no client cancellation involved) counts against
+// hedge_requests_failed_total and NOT hedge_requests_canceled_total.
+func TestAllBackendsFailIncrementsFailedRequests(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, FirstTokenDelay: 2 * time.Millisecond, EmitFinish: true}
+	reg := metrics.NewRegistry(nil)
+	h := newTestHandler(t, []backend.Backend{primary}, policy.HedgePolicy{FireAfter: 2 * time.Millisecond, MaxInFlight: 1}, clk, reg)
+
+	stop := driveClock(clk, time.Millisecond)
+	defer stop()
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(postBody(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	var b strings.Builder
+	_, _ = reg.WriteTo(&b)
+	out := b.String()
+	if !strings.Contains(out, "hedge_requests_failed_total 1") {
+		t.Errorf("genuine all-backends failure must increment hedge_requests_failed_total:\n%s", out)
+	}
+	if !strings.Contains(out, "hedge_requests_canceled_total 0") {
+		t.Errorf("genuine all-backends failure must NOT increment hedge_requests_canceled_total:\n%s", out)
+	}
+}
+
 func TestInvalidRequests(t *testing.T) {
 	clk := clock.NewFakeClock(time.Time{})
 	primary := &backend.FakeBackend{BackendName: "p", Clock: clk, Tokens: []string{"x"}}
@@ -244,7 +276,8 @@ func TestClientDisconnectCancels(t *testing.T) {
 		BackendName: "p", Clock: clk,
 		FirstTokenDelay: time.Hour, Tokens: []string{"x"},
 	}
-	h := newTestHandler(t, []backend.Backend{primary}, policy.HedgePolicy{FireAfter: time.Second, MaxInFlight: 1}, clk, nil)
+	reg := metrics.NewRegistry(nil)
+	h := newTestHandler(t, []backend.Backend{primary}, policy.HedgePolicy{FireAfter: time.Second, MaxInFlight: 1}, clk, reg)
 
 	stop := driveClock(clk, time.Millisecond)
 	defer stop()
@@ -274,6 +307,28 @@ func TestClientDisconnectCancels(t *testing.T) {
 		// covered by the engine tests. Here we just ensure no hang.
 	case <-time.After(3 * time.Second):
 		t.Fatal("client request did not return after cancel")
+	}
+
+	// h.report runs in the server-side goroutine, which races the HTTP
+	// client's own return above, so poll briefly instead of asserting at
+	// once. A client disconnect must land on hedge_requests_canceled_total,
+	// never on hedge_requests_failed_total (the backend was still racing and
+	// never actually failed).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var b strings.Builder
+		_, _ = reg.WriteTo(&b)
+		out := b.String()
+		if strings.Contains(out, "hedge_requests_canceled_total 1") {
+			if !strings.Contains(out, "hedge_requests_failed_total 0") {
+				t.Fatalf("client disconnect must not also count as failed:\n%s", out)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hedge_requests_canceled_total never reached 1:\n%s", out)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
