@@ -274,6 +274,28 @@ func TestRequestsFailedCounter(t *testing.T) {
 	}
 }
 
+// TestRequestsCanceledCounter checks that hedge_requests_canceled_total is a
+// distinct counter from hedge_requests_failed_total: incrementing one must
+// not move the other, so a burst of client disconnects cannot be mistaken for
+// an all-backends-down outage on the failed counter.
+func TestRequestsCanceledCounter(t *testing.T) {
+	r := NewRegistry(nil)
+	r.IncCanceledRequests()
+	r.IncCanceledRequests()
+	r.IncCanceledRequests()
+	r.IncFailedRequests()
+	p := parseExposition(t, render(t, r))
+	if p.typ["hedge_requests_canceled_total"] != "counter" {
+		t.Errorf("requests_canceled type=%q", p.typ["hedge_requests_canceled_total"])
+	}
+	if got := sampleValue(p, "hedge_requests_canceled_total", nil); got != "3" {
+		t.Errorf("requests_canceled=%s want 3", got)
+	}
+	if got := sampleValue(p, "hedge_requests_failed_total", nil); got != "1" {
+		t.Errorf("requests_failed=%s want 1 (must not be inflated by IncCanceledRequests)", got)
+	}
+}
+
 func TestHistogramCumulativeAndInfBucket(t *testing.T) {
 	r := NewRegistry([]float64{0.1, 0.5, 1.0})
 	// Observations (seconds): 0.05, 0.2, 0.2, 0.7, 5.0

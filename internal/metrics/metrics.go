@@ -96,6 +96,7 @@ type lossKey struct {
 type Registry struct {
 	requestsTotal          atomic.Uint64
 	requestsFailedTotal    atomic.Uint64
+	requestsCanceledTotal  atomic.Uint64
 	redundantRequestsTotal atomic.Uint64
 	latencySavedSeconds    atomic.Uint64 // float64 bits via math.Float64bits
 
@@ -162,8 +163,20 @@ func (r *Registry) SetBuildInfo(version, goVersion string) {
 func (r *Registry) IncRequests() { r.requestsTotal.Add(1) }
 
 // IncFailedRequests increments hedge_requests_failed_total (requests that
-// produced no winner — every backend failed, so the client got an error).
+// produced no winner because the backends failed, produced no usable token,
+// or the request_timeout ceiling fired — an outcome an operator should
+// investigate). It must NOT be called for a client-side cancellation; use
+// IncCanceledRequests for that case instead, so a burst of abandoned browser
+// tabs does not read as an upstream outage.
 func (r *Registry) IncFailedRequests() { r.requestsFailedTotal.Add(1) }
+
+// IncCanceledRequests increments hedge_requests_canceled_total (requests that
+// produced no winner because the client's own context was cancelled — e.g. it
+// disconnected or gave up — before any backend could win). These are
+// deliberately NOT counted in hedge_requests_failed_total: the backends were
+// still racing and may well have gone on to succeed, so this is not evidence
+// of an upstream problem.
+func (r *Registry) IncCanceledRequests() { r.requestsCanceledTotal.Add(1) }
 
 // AddRedundantRequests adds n to hedge_redundant_requests_total (the number of
 // speculative backups started beyond the primary).
@@ -292,6 +305,10 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 	writeCounter(&b, "hedge_requests_failed_total",
 		"Requests that produced no winner (every backend failed).",
 		r.requestsFailedTotal.Load())
+
+	writeCounter(&b, "hedge_requests_canceled_total",
+		"Requests that produced no winner because the client disconnected before any backend won (not counted as failed).",
+		r.requestsCanceledTotal.Load())
 
 	// Per-backend win counter (a single HELP/TYPE header, one line per label).
 	b.WriteString("# HELP hedge_backend_wins_total Requests won by each backend.\n")

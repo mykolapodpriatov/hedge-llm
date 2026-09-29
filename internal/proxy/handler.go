@@ -28,6 +28,7 @@ import (
 type MetricsReporter interface {
 	IncRequests()
 	IncFailedRequests()
+	IncCanceledRequests()
 	AddRedundantRequests(n int)
 	ObserveWin(backend string)
 	ObserveLoss(backend, reason string)
@@ -143,7 +144,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *oapi.
 	}
 	sink := &sseSink{w: w, flusher: flusher}
 	outcome, err := h.engine.Run(r.Context(), req, sink)
-	h.report(outcome, req)
+	h.report(outcome, err)
 
 	if !sink.committed {
 		// Nothing was written yet: return a clean error response.
@@ -161,7 +162,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request, req *oapi.
 func (h *Handler) serveJSON(w http.ResponseWriter, r *http.Request, req *oapi.Request) {
 	sink := &jsonSink{}
 	outcome, err := h.engine.Run(r.Context(), req, sink)
-	h.report(outcome, req)
+	h.report(outcome, err)
 
 	if !sink.committed {
 		h.writeUncommittedError(w, err)
@@ -201,19 +202,29 @@ func (h *Handler) writeUncommittedError(w http.ResponseWriter, err error) {
 	}
 }
 
-// report pushes the outcome to metrics and the latency observer.
-func (h *Handler) report(o hedge.Outcome, _ *oapi.Request) {
+// report pushes the outcome to metrics and the latency observer. err is
+// whatever engine.Run returned alongside o, used only to tell a client-side
+// cancellation apart from a genuine all-backends failure (see
+// IncCanceledRequests).
+func (h *Handler) report(o hedge.Outcome, err error) {
 	if h.metrics != nil {
 		h.metrics.AddRedundantRequests(o.RedundantStarts())
 		for _, l := range o.Losses {
 			h.metrics.ObserveLoss(l.Backend, l.Reason)
 		}
-		if o.Winner != "" {
+		switch {
+		case o.Winner != "":
 			h.metrics.ObserveWin(o.Winner)
 			h.metrics.ObserveFirstToken(o.FirstTokenLatency)
 			h.metrics.AddLatencySaved(o.LatencySaved())
-		} else {
-			// No winner: every backend failed and the client gets an error.
+		case isContextCanceled(err):
+			// The client went away before any backend could win — the
+			// backends were still racing and may well have gone on to
+			// succeed, so this is not evidence of an upstream problem.
+			h.metrics.IncCanceledRequests()
+		default:
+			// No winner and not a client cancellation: every backend failed,
+			// produced no usable token, or the request_timeout ceiling fired.
 			h.metrics.IncFailedRequests()
 		}
 	}
