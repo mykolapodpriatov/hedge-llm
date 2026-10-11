@@ -50,6 +50,12 @@ func newHistogram(bounds []float64) *histogram {
 }
 
 func (h *histogram) observe(v float64) {
+	// A non-finite sample is not a latency. NaN compares false against every
+	// bound, so it would land in the +Inf bucket, and adding it to the sum
+	// poisons every later scrape.
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// Find the first bound >= v; values exceeding all bounds land in the
