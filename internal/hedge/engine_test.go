@@ -360,6 +360,45 @@ func TestMaxInFlightCap(t *testing.T) {
 	}
 }
 
+// max_in_flight counts backends of one request. A second request's primary
+// must not consume the first request's backup slot.
+func TestMaxInFlightIsPerRequest(t *testing.T) {
+	clk := clock.NewFakeClock(time.Time{})
+	mk := func(name string) *backend.FakeBackend {
+		return &backend.FakeBackend{
+			BackendName: name, Clock: clk,
+			FirstTokenDelay: time.Hour,
+			Tokens:          []string{"x"},
+		}
+	}
+	pol := policy.HedgePolicy{FireAfter: 5 * time.Millisecond, MaxInFlight: 2}
+	e := NewEngine([]backend.Backend{mk("a"), mk("b")}, pol, clk)
+
+	d := startDriver(clk, 2*time.Millisecond)
+	defer d.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type res struct{ started int }
+	ch := make(chan res, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			o, _ := e.Run(ctx, testReq(), &captureSink{})
+			ch <- res{o.Started}
+		}()
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := e.InFlight(); got != 4 {
+		t.Errorf("InFlight=%d, want 4 (two requests, two backends each)", got)
+	}
+	cancel()
+	for i := 0; i < 2; i++ {
+		if started := (<-ch).started; started != 2 {
+			t.Errorf("started=%d, want 2", started)
+		}
+	}
+}
+
 // cost_ceiling blocks an extra backend even with in-flight headroom.
 func TestCostCeilingBlocks(t *testing.T) {
 	clk := clock.NewFakeClock(time.Time{})
@@ -393,8 +432,9 @@ func TestCostCeilingBlocks(t *testing.T) {
 	}
 }
 
-// The check-and-increment is atomic under concurrent Runs sharing one engine:
-// the engine-wide InFlight never exceeds MaxInFlight even under load.
+// Concurrent Runs share one engine. max_in_flight is per request, so the
+// global gauge may reach runs*MaxInFlight. It must not go negative, and the
+// check-and-increment stays race-free.
 func TestConcurrentStartsRespectCapAtomically(t *testing.T) {
 	clk := clock.NewFakeClock(time.Time{})
 	mk := func(name string) *backend.FakeBackend {
