@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -293,6 +294,28 @@ func TestRequestsCanceledCounter(t *testing.T) {
 	}
 	if got := sampleValue(p, "hedge_requests_failed_total", nil); got != "1" {
 		t.Errorf("requests_failed=%s want 1 (must not be inflated by IncCanceledRequests)", got)
+	}
+}
+
+func TestHistogramSkipsNonFiniteSamples(t *testing.T) {
+	h := newHistogram([]float64{0.1, 1})
+	h.observe(0.2)
+	h.observe(math.NaN())
+	h.observe(math.Inf(1))
+	h.observe(math.Inf(-1))
+	snap := h.snapshot()
+	if snap.count != 1 {
+		t.Fatalf("count=%d want 1", snap.count)
+	}
+	if snap.sum != 0.2 {
+		t.Fatalf("sum=%v want 0.2", snap.sum)
+	}
+	var total uint64
+	for _, c := range snap.cumulative {
+		total = c
+	}
+	if total != 1 {
+		t.Fatalf("cumulative +Inf=%d want 1", total)
 	}
 }
 
