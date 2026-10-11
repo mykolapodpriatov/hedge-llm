@@ -503,6 +503,19 @@ func (r *run) committedCostDelta() float64 {
 	return c
 }
 
+// runningCount is how many backends this request still holds a reservation
+// for. A start that failed synchronously is excluded, because startNext
+// already rolled that reservation back.
+func (r *run) runningCount() int {
+	n := 0
+	for _, st := range r.states {
+		if !st.failed {
+			n++
+		}
+	}
+	return n
+}
+
 // startNext attempts a policy-gated check-and-increment under the engine mutex
 // and, if allowed, starts the next backend with its own per-backend context and
 // forwarder goroutine. Returns true if a start was ATTEMPTED (the backend index
@@ -519,8 +532,10 @@ func (r *run) startNext() bool {
 
 	e.mu.Lock()
 	// The first backend of THIS run is the primary and always starts. For
-	// backups, enforce both bounds atomically under the single lock.
-	if len(r.states) > 0 && !r.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest()) {
+	// backups, both bounds are per request. e.inFlight and e.committedCost
+	// are the shared gauge and the reservation book. Using them as the cap
+	// would let one request's primary block another request's backup.
+	if len(r.states) > 0 && !r.pol.AllowStart(r.runningCount(), r.committedCostDelta(), be.CostPerRequest()) {
 		e.mu.Unlock()
 		return false
 	}
@@ -648,7 +663,7 @@ func (r *run) race(sink Sink) (winnerName string, firstTok, primaryFirst time.Du
 	// check-and-increment inside startNext, so a stale hint can only cost a
 	// harmless extra timer fire that startNext then declines.
 	armFire := func() {
-		if r.pol.HasHeadroom(e.InFlight()) && r.hasMore() {
+		if r.pol.HasHeadroom(r.runningCount()) && r.hasMore() {
 			fireTimer.Reset(r.fireAfter)
 			armed = true
 		} else {
@@ -825,7 +840,7 @@ func (r *run) canStartAnother() bool {
 	if len(r.states) == 0 {
 		return true
 	}
-	return r.pol.AllowStart(e.inFlight, e.committedCost, be.CostPerRequest())
+	return r.pol.AllowStart(r.runningCount(), r.committedCostDelta(), be.CostPerRequest())
 }
 
 // noPathToWinner reports whether the race can no longer reach a usable token: no
@@ -846,7 +861,7 @@ func (r *run) noPathToWinner() bool {
 // shouldStartAfterLoss reports whether the policy still permits starting another
 // backend (headroom remains and one is left).
 func (r *run) shouldStartAfterLoss() bool {
-	return r.pol.HasHeadroom(r.e.InFlight()) && r.hasMore()
+	return r.pol.HasHeadroom(r.runningCount()) && r.hasMore()
 }
 
 // releaseN decrements the engine-wide in-flight reservation by n and the
